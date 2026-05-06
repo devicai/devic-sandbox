@@ -6,6 +6,7 @@ services:
     volumes:
       - ./config.yml:/app/config.yml:ro
       - snapshots-data:/root/.microsandbox/snapshots
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URI=${DATABASE_URI:-mongodb://mongo:27017/devic-sandbox}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
