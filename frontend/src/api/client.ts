@@ -32,6 +32,28 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// Redirect to /settings when the API rejects the credentials. Skip the redirect
+// for the settings page itself (so its "Test connection" button surfaces 401
+// inline) and for an already-current /settings location.
+let redirectingForAuth = false;
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    const status = err?.response?.status;
+    if (status === 401 || status === 403) {
+      const onSettings = window.location.pathname.startsWith('/settings');
+      if (!onSettings && !redirectingForAuth) {
+        redirectingForAuth = true;
+        setTimeout(() => {
+          redirectingForAuth = false;
+        }, 2000);
+        window.location.assign('/settings');
+      }
+    }
+    return Promise.reject(err);
+  },
+);
+
 // Sandboxes
 export const sandboxesApi = {
   getAll(params?: { limit?: number; offset?: number; status?: string }): Promise<AxiosResponse<PaginatedResponse<SandboxDto>>> {

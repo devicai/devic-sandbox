@@ -2,18 +2,20 @@ services:
   app:
     build: .
     ports:
-      - "${PORT:-3200}:3200"
+      - "127.0.0.1:${PORT:-3200}:3200"
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - snapshots-data:/root/.microsandbox/snapshots
+      - snapshots-data:/root/.devic-sandbox/snapshots
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URI=${DATABASE_URI:-mongodb://mongo:27017/devic-sandbox}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - SANDBOX_API_KEY=${SANDBOX_API_KEY:-}
 
   frontend:
     build: ./frontend
     ports:
-      - "${FRONTEND_PORT:-5174}:80"
+      - "127.0.0.1:${FRONTEND_PORT:-5174}:80"
     depends_on:
       - app
 
@@ -23,7 +25,7 @@ services:
     image: mongo:7
     profiles: [infra]
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -36,7 +38,7 @@ services:
     image: redis:7-alpine
     profiles: [infra]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:

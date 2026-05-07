@@ -20,7 +20,9 @@ import { API_CATEGORIES, API_ENDPOINTS, type EndpointSpec } from './endpoints';
 const { Title, Text } = Typography;
 const { TextArea } = Input;
 
-const API_BASE = (import.meta.env.VITE_API_URL || '/api/v1').replace(/\/$/, '');
+const DEFAULT_API_BASE =
+  typeof window !== 'undefined' ? `${window.location.origin}/api/v1` : '/api/v1';
+const API_BASE = (import.meta.env.VITE_API_URL || DEFAULT_API_BASE).replace(/\/$/, '');
 
 const METHOD_COLORS: Record<string, string> = {
   GET: 'blue',

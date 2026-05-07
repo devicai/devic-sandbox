@@ -60,6 +60,9 @@ mcp:
   enabled: true
 
 auth:
+  # Set to true to require an API key on every /api/v1/* request.
+  # Provide the key via SANDBOX_API_KEY in .env. The frontend Settings page
+  # lets users save the same key in localStorage so it is sent automatically.
   enabled: false
   strategy: api-key
   apiKeys:

@@ -59,6 +59,7 @@ const SnapshotsPage: React.FC = () => {
 
   const snapshots = data?.data ?? [];
   const totalDiskBytes = usage?.disk.usedBytes ?? 0;
+  const diskLimitBytes = usage?.disk.limitBytes ?? 0;
   const dbReportedBytes = snapshots
     .filter((s) => s.status === 'ready')
     .reduce((acc, s) => acc + (s.sizeBytes ?? 0), 0);
@@ -139,18 +140,19 @@ const SnapshotsPage: React.FC = () => {
       render: (bytes: number) => <span style={{ fontSize: 11 }}>{formatSize(bytes)}</span>,
     },
     {
-      title: 'Disk share',
+      title: 'Quota share',
       key: 'diskShare',
-      width: 90,
+      width: 100,
       align: 'right',
       render: (_: any, row) => {
-        if (row.status !== 'ready' || totalDiskBytes <= 0) {
+        if (row.status !== 'ready' || diskLimitBytes <= 0) {
           return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
         }
-        const pct = ((row.sizeBytes ?? 0) / totalDiskBytes) * 100;
+        const pct = ((row.sizeBytes ?? 0) / diskLimitBytes) * 100;
+        const display = pct < 0.01 ? '<0.01%' : `${pct.toFixed(2)}%`;
         return (
-          <Tooltip title={`${formatSize(row.sizeBytes ?? 0)} of ${formatSize(totalDiskBytes)} actually on disk`}>
-            <span style={{ fontSize: 11 }}>{pct.toFixed(1)}%</span>
+          <Tooltip title={`${formatSize(row.sizeBytes ?? 0)} of ${formatSize(diskLimitBytes)} disk quota`}>
+            <span style={{ fontSize: 11 }}>{display}</span>
           </Tooltip>
         );
       },

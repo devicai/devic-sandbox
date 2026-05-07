@@ -1,6 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Sandbox as MsbSandbox, Patch } from 'microsandbox';
-import type { SandboxConfig, ExecHandle, ExecEvent } from 'microsandbox';
+import type {
+  Sandbox as MsbSandbox,
+  SandboxConfig,
+  ExecHandle,
+  ExecEvent,
+} from 'microsandbox';
 import {
   ExecResult,
   ExecStream,
@@ -11,6 +15,16 @@ import {
   RuntimeSandboxConfig,
   RuntimeStatus,
 } from './runtime-provider.interface';
+
+// The microsandbox SDK is loaded lazily so this module can be imported on hosts
+// where the native binding cannot dlopen (e.g. node:24-slim without libdbus).
+// Without this, selecting `runtime.type=docker` still crashes at startup
+// because RuntimeModule eagerly imports both providers.
+type MicrosandboxSdk = typeof import('microsandbox');
+let _sdk: MicrosandboxSdk | null = null;
+function sdk(): MicrosandboxSdk {
+  return (_sdk ??= require('microsandbox'));
+}
 
 @Injectable()
 export class MicrosandboxRuntimeProvider implements RuntimeProvider {
@@ -24,7 +38,7 @@ export class MicrosandboxRuntimeProvider implements RuntimeProvider {
       cpus: cfg.cpus,
       memoryMib: cfg.memoryMib,
       env: cfg.env,
-      patches: [Patch.mkdir(cfg.workdir)],
+      patches: [sdk().Patch.mkdir(cfg.workdir)],
       network: {
         policy: (cfg.networkPolicy ?? 'allow-all') as any,
         tls: { interceptedPorts: [] },
@@ -40,13 +54,13 @@ export class MicrosandboxRuntimeProvider implements RuntimeProvider {
       }
     }
 
-    const instance = await MsbSandbox.create(msbConfig);
+    const instance = await sdk().Sandbox.create(msbConfig);
     return new MicrosandboxSandbox(cfg.name, instance);
   }
 
   async get(name: string): Promise<RuntimeHandle | null> {
     try {
-      const handle: any = await MsbSandbox.get(name);
+      const handle: any = await sdk().Sandbox.get(name);
       const status = mapStatus(handle.status);
       return {
         status,
@@ -70,7 +84,7 @@ export class MicrosandboxRuntimeProvider implements RuntimeProvider {
 
   async remove(name: string): Promise<void> {
     try {
-      await MsbSandbox.remove(name);
+      await sdk().Sandbox.remove(name);
     } catch (err) {
       this.logger.warn(
         `microsandbox.remove(${name}) failed: ${(err as Error).message}`,

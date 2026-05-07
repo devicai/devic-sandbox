@@ -6,6 +6,7 @@ import ProfilesPage from './components/Profiles/ProfilesPage';
 import SnapshotsPage from './components/Snapshots/SnapshotsPage';
 import McpPage from './components/Mcp/McpPage';
 import ApiPage from './components/Api/ApiPage';
+import SettingsPage from './components/Settings/SettingsPage';
 
 const THEME_TOKENS = {
   colorPrimary: '#4661B1',
@@ -50,6 +51,7 @@ const App: React.FC = () => {
             <Route path="/profiles" element={<ProfilesPage />} />
             <Route path="/mcp" element={<McpPage />} />
             <Route path="/api" element={<ApiPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/sandboxes" replace />} />
           </Route>
         </Routes>

@@ -21,10 +21,10 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
-import { useCreateSnapshot } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
 import CreateSandboxModal from './CreateSandboxModal';
+import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
 import UsagePanel from '../Usage/UsagePanel';
 
@@ -52,12 +52,46 @@ const SandboxesPage: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<string | undefined>();
   const [createOpen, setCreateOpen] = useState(false);
   const [terminalSandbox, setTerminalSandbox] = useState<SandboxDto | null>(null);
+  const [snapshotSandbox, setSnapshotSandbox] = useState<SandboxDto | null>(null);
+  const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
+  const [destroyingIds, setDestroyingIds] = useState<Set<string>>(new Set());
 
   const { data, isLoading } = useSandboxes({ status: statusFilter });
   const { data: usage, isLoading: usageLoading } = useUsage();
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
-  const createSnapshot = useCreateSnapshot();
+
+  const handleStop = async (id: string) => {
+    setStoppingIds((prev) => new Set(prev).add(id));
+    try {
+      await stopSandbox.mutateAsync(id);
+      message.success('Sandbox stopped');
+    } catch (e: any) {
+      message.error(e?.message ?? 'Stop failed');
+    } finally {
+      setStoppingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const handleDestroy = async (id: string) => {
+    setDestroyingIds((prev) => new Set(prev).add(id));
+    try {
+      await destroySandbox.mutateAsync(id);
+      message.success('Sandbox destroyed');
+    } catch (e: any) {
+      message.error(e?.message ?? 'Destroy failed');
+    } finally {
+      setDestroyingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
 
   const sandboxes = data?.data ?? [];
   const totalMemoryMib = usage?.memory.usedMib ?? 0;
@@ -154,39 +188,33 @@ const SandboxesPage: React.FC = () => {
                 <Button
                   size="small"
                   icon={<FontAwesomeIcon icon={faCamera} />}
-                  onClick={() =>
-                    createSnapshot
-                      .mutateAsync({ sandboxId: row.sandboxId })
-                      .then(() => message.success('Snapshot created'))
-                      .catch((e) => message.error(e?.message ?? 'Snapshot failed'))
-                  }
+                  onClick={() => setSnapshotSandbox(row)}
                 />
               </Tooltip>
-              <Tooltip title="Stop">
+              <Tooltip title={stoppingIds.has(row.sandboxId) ? 'Stopping…' : 'Stop'}>
                 <Button
                   size="small"
                   icon={<FontAwesomeIcon icon={faStop} />}
-                  onClick={() =>
-                    stopSandbox
-                      .mutateAsync(row.sandboxId)
-                      .then(() => message.success('Sandbox stopped'))
-                      .catch((e) => message.error(e?.message ?? 'Stop failed'))
-                  }
+                  loading={stoppingIds.has(row.sandboxId)}
+                  disabled={stoppingIds.has(row.sandboxId)}
+                  onClick={() => handleStop(row.sandboxId)}
                 />
               </Tooltip>
             </>
           )}
           <Popconfirm
             title="Destroy this sandbox?"
-            onConfirm={() =>
-              destroySandbox
-                .mutateAsync(row.sandboxId)
-                .then(() => message.success('Sandbox destroyed'))
-                .catch((e) => message.error(e?.message ?? 'Destroy failed'))
-            }
+            onConfirm={() => handleDestroy(row.sandboxId)}
+            disabled={destroyingIds.has(row.sandboxId)}
           >
-            <Tooltip title="Destroy">
-              <Button size="small" danger icon={<FontAwesomeIcon icon={faTrash} />} />
+            <Tooltip title={destroyingIds.has(row.sandboxId) ? 'Destroying…' : 'Destroy'}>
+              <Button
+                size="small"
+                danger
+                icon={<FontAwesomeIcon icon={faTrash} />}
+                loading={destroyingIds.has(row.sandboxId)}
+                disabled={destroyingIds.has(row.sandboxId)}
+              />
             </Tooltip>
           </Popconfirm>
         </Space>
@@ -252,6 +280,11 @@ const SandboxesPage: React.FC = () => {
       <TerminalDrawer
         sandbox={terminalSandbox}
         onClose={() => setTerminalSandbox(null)}
+      />
+
+      <CreateSnapshotModal
+        sandbox={snapshotSandbox}
+        onClose={() => setSnapshotSandbox(null)}
       />
     </div>
   );

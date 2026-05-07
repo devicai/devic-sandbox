@@ -31,7 +31,10 @@ import McpProfileModal from './McpProfileModal';
 
 const { Title, Text, Paragraph } = Typography;
 
-const DEFAULT_MCP_BASE_URL = 'http://localhost:3200/api/v1/mcp';
+const DEFAULT_MCP_BASE_URL =
+  typeof window !== 'undefined'
+    ? `${window.location.origin}/api/v1/mcp`
+    : 'http://localhost:3200/api/v1/mcp';
 const MCP_BASE_URL = (import.meta.env.VITE_MCP_BASE_URL || DEFAULT_MCP_BASE_URL).replace(/\/$/, '');
 
 function copyToClipboard(text: string) {
