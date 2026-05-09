@@ -206,12 +206,22 @@ const HotPoolSettingsCard: React.FC = () => {
               style={{ width: '100%' }}
             />
           </Form.Item>
-          <Form.Item label="Max pool size" style={{ ...FORM_ITEM, flex: 1, minWidth: 140 }}>
+          <Form.Item
+            label={
+              <Tooltip title="Optional safety ceiling. Clear the field to let the reserve % be the only cap.">
+                <span>Max pool size</span>
+              </Tooltip>
+            }
+            style={{ ...FORM_ITEM, flex: 1, minWidth: 140 }}
+          >
             <InputNumber
               min={1}
               max={1000}
-              value={form.maxSize}
-              onChange={(v) => onChange('maxSize', v ?? undefined)}
+              value={form.maxSize ?? undefined}
+              // null = explicit "clear" so the backend drops the persisted value;
+              // undefined would just be omitted from the PUT body.
+              onChange={(v) => onChange('maxSize', (v ?? null) as any)}
+              placeholder="no cap"
               style={{ width: '100%' }}
             />
           </Form.Item>
@@ -257,11 +267,11 @@ const HotPoolSettingsCard: React.FC = () => {
                 ? `${projectedSlots} pods (${(projectedSlots * memPer).toLocaleString()} MiB)`
                 : `${form.targetSize ?? form.minSize ?? 0} pods (${((form.targetSize ?? form.minSize ?? 0) * memPer).toLocaleString()} MiB)`}
             </strong>
-            {form.maxSize !== undefined && (
+            {form.maxSize ? (
               <Text style={{ marginLeft: 8, fontSize: 12, opacity: 0.7 }}>
                 bounded by min={form.minSize ?? 0} / max={form.maxSize}
               </Text>
-            )}
+            ) : null}
           </span>
         }
         style={{ marginTop: 4 }}

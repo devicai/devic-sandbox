@@ -73,8 +73,13 @@ hotPool:
   memoryMibPerSandbox: 512
   cpus: 1
   # Pool sizing bounds.
+  # `minSize` is the floor: at least this many pods are kept warm even if the
+  # percent calculation rounds down. `maxSize` is an optional safety ceiling —
+  # leave it unset to let `memoryReservePercent` × `memoryMibPerSandbox` be
+  # the only cap. Set it only if you want a hard limit independent of the
+  # percent reserve.
   minSize: 0
-  maxSize: 20
+  # maxSize: 20
   # Reconcile cadence (ms).
   reconcileIntervalMs: 15000
 

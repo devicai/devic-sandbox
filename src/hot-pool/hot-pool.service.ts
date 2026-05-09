@@ -95,6 +95,7 @@ export class HotPoolService implements OnModuleInit {
     if (
       patch.minSize !== undefined &&
       patch.maxSize !== undefined &&
+      patch.maxSize !== null &&
       patch.minSize > patch.maxSize
     ) {
       throw new BadRequestException('minSize cannot exceed maxSize');
@@ -102,16 +103,24 @@ export class HotPoolService implements OnModuleInit {
 
     // class-transformer materializes every optional field as `undefined` on
     // the DTO instance, which would clobber the live config on spread. Strip
-    // explicit undefineds so the merge keeps existing values.
+    // explicit undefineds so the merge keeps existing values. An explicit
+    // `null` means "clear this field" — fields that support it (e.g.
+    // `maxSize`, `targetSize`) are removed from the merged config so their
+    // fallback semantics kick back in.
     const sanitized: Partial<HotPoolConfig> = {};
+    const cleared = new Set<string>();
     for (const [k, v] of Object.entries(patch)) {
-      if (v !== undefined) (sanitized as any)[k] = v;
+      if (v === undefined) continue;
+      if (v === null) cleared.add(k);
+      else (sanitized as any)[k] = v;
     }
 
-    const next: HotPoolConfig = {
+    const merged: any = {
       ...this.liveConfig,
       ...sanitized,
     };
+    for (const k of cleared) delete merged[k];
+    const next: HotPoolConfig = merged;
 
     if (next.enabled && !next.snapshotId) {
       throw new BadRequestException(
@@ -392,7 +401,10 @@ export class HotPoolService implements OnModuleInit {
   private computeTargetSize(): number {
     const cfg = this.liveConfig;
     const min = cfg.minSize ?? 0;
-    const cap = cfg.maxSize ?? 20;
+    // maxSize is an optional safety ceiling. When unset there is no upper
+    // bound beyond what `memoryReservePercent` × `memoryMibPerSandbox` already
+    // implies — that calculation is the real reserve cap.
+    const cap = cfg.maxSize ?? Number.POSITIVE_INFINITY;
 
     // Explicit fixed size wins.
     if (cfg.targetSize !== undefined && cfg.targetSize !== null) {

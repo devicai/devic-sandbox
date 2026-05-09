@@ -6,6 +6,7 @@ import {
   IsString,
   Max,
   Min,
+  ValidateIf,
 } from 'class-validator';
 
 /**
@@ -55,12 +56,18 @@ export class UpdateHotPoolDto {
   @Max(1000)
   minSize?: number;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({
+    description:
+      'Optional safety ceiling for the pool. Pass `null` to clear and let `memoryReservePercent` × `memoryMibPerSandbox` be the only cap.',
+    type: Number,
+    nullable: true,
+  })
   @IsOptional()
+  @ValidateIf((_, value) => value !== null)
   @IsInt()
   @Min(1)
   @Max(1000)
-  maxSize?: number;
+  maxSize?: number | null;
 
   @ApiPropertyOptional({
     description:

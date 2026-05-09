@@ -86,7 +86,6 @@ export function loadConfig(configPath?: string): ModuleConfig {
     memoryMibPerSandbox: resolved.defaults.defaultMemoryMib,
     cpus: resolved.defaults.defaultCpus,
     minSize: 0,
-    maxSize: 20,
     reconcileIntervalMs: 15000,
     ...(resolved.hotPool ?? {}),
   };
