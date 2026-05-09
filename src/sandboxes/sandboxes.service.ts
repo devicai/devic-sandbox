@@ -243,7 +243,16 @@ export class SandboxesService {
       command = `${envPrefix}; ${command}`;
     }
 
-    const fullCommand = `cd '${cwd}' && ${command} ; echo "${CWD_MARKER}$(pwd)"`;
+    // Wrap the user command so we can:
+    //   (a) cd into the requested cwd before running it,
+    //   (b) print a marker line afterwards so we can detect if the command
+    //       itself changed cwd (e.g. `cd subdir`),
+    //   (c) preserve the user command's real exit code as the sh -c exit
+    //       code — `; echo …` would always make echo the last command and
+    //       mask non-zero exits like `false` (1) or missing binaries (127).
+    const fullCommand =
+      `cd '${cwd}' && { ${command}; __devic_ec=$?; ` +
+      `echo "${CWD_MARKER}$(pwd)"; exit $__devic_ec; }`;
     const result = await sandbox.exec(fullCommand);
     const stdout = result.stdout;
     const stderr = result.stderr;
