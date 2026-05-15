@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import type {
   Sandbox as MsbSandbox,
   SandboxConfig,
@@ -15,7 +16,16 @@ import {
   RuntimeSandboxConfig,
   RuntimeStatus,
   SandboxAddress,
+  ShellRunOptions,
+  ShellRunResult,
+  ShellRunStream,
+  ShellSession,
 } from './runtime-provider.interface';
+import {
+  buildWrappedCommand,
+  MarkerProcessor,
+  parseStdoutMeta,
+} from './shell-protocol';
 
 // The microsandbox SDK is loaded lazily so this module can be imported on hosts
 // where the native binding cannot dlopen (e.g. node:24-slim without libdbus).
@@ -196,7 +206,246 @@ class MicrosandboxSandbox implements RuntimeSandbox {
     await this.inst.fs().copyFromHost(hostPath, guestPath);
   }
 
+  async openShell(initialCwd?: string): Promise<ShellSession> {
+    return new MicrosandboxShellSession(this.inst, initialCwd);
+  }
+
   async detach(): Promise<void> {
     await this.inst.detach();
   }
+}
+
+/**
+ * Microsandbox emulation of a persistent shell session.
+ *
+ * The microsandbox SDK only exposes one-shot `shell()` / `shellStream()`
+ * calls, so there is no actual long-lived shell process to talk to. We fake
+ * persistence by remembering the cwd in memory and re-`cd`-ing into it on
+ * every call (using the same `buildWrappedCommand` wrapper as Docker so the
+ * end-of-command marker tells us where the user's command left the cwd).
+ *
+ * Limitations vs. the Docker shell session:
+ *   - `export VAR=...` inside a user command does NOT persist across calls.
+ *     Callers that need persistent env vars must pass them via `ShellRunOptions.env`
+ *     on every call (the same as the legacy agent exec API).
+ *   - Shell functions, aliases, and any other in-shell state are lost between
+ *     calls for the same reason.
+ *
+ * `cd` persistence works as expected, which is the most common need.
+ */
+class MicrosandboxShellSession implements ShellSession {
+  private cwd: string | undefined;
+  private queue: Promise<unknown> = Promise.resolve();
+  private _closed = false;
+
+  constructor(
+    private readonly inst: MsbSandbox,
+    initialCwd?: string,
+  ) {
+    this.cwd = initialCwd && initialCwd.trim() ? initialCwd : undefined;
+  }
+
+  get closed(): boolean {
+    return this._closed;
+  }
+
+  async close(): Promise<void> {
+    this._closed = true;
+  }
+
+  async run(command: string, opts?: ShellRunOptions): Promise<ShellRunResult> {
+    if (this._closed) throw new Error('Shell session is closed');
+    const previous = this.queue;
+    let release!: () => void;
+    this.queue = new Promise<void>((res) => {
+      release = res;
+    });
+    await previous.catch(() => undefined);
+    try {
+      const marker = `__DEVIC_END_${randomUUID().replace(/-/g, '')}__`;
+      const effectiveCwd = opts?.cwd ?? this.cwd;
+      const wrapped = buildWrappedCommand(command, marker, {
+        ...opts,
+        cwd: effectiveCwd,
+      });
+      const result = await this.inst.shell(wrapped);
+      const rawStdout = result.stdout();
+      const rawStderr = result.stderr();
+      const stdout = stripMarker(rawStdout, marker);
+      const stderr = stripMarker(rawStderr, marker);
+      const meta = stdout.meta ? parseStdoutMeta(stdout.meta) : null;
+      const code = meta?.code ?? result.code ?? 0;
+      const cwd = meta?.cwd ?? effectiveCwd ?? '';
+      if (cwd) this.cwd = cwd;
+      return {
+        code,
+        cwd,
+        stdout: stdout.text,
+        stderr: stderr.text,
+      };
+    } finally {
+      release();
+    }
+  }
+
+  async runStream(
+    command: string,
+    opts?: ShellRunOptions,
+  ): Promise<ShellRunStream> {
+    if (this._closed) throw new Error('Shell session is closed');
+    const previous = this.queue;
+    let release!: () => void;
+    this.queue = new Promise<void>((res) => {
+      release = res;
+    });
+    await previous.catch(() => undefined);
+
+    const marker = `__DEVIC_END_${randomUUID().replace(/-/g, '')}__`;
+    const effectiveCwd = opts?.cwd ?? this.cwd;
+    const wrapped = buildWrappedCommand(command, marker, {
+      ...opts,
+      cwd: effectiveCwd,
+    });
+
+    const queue: ExecStreamEvent[] = [];
+    let pendingResolve:
+      | ((v: IteratorResult<ExecStreamEvent>) => void)
+      | null = null;
+    let streamDone = false;
+    let streamError: Error | null = null;
+
+    const pushEvent = (evt: ExecStreamEvent) => {
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: evt, done: false });
+      } else {
+        queue.push(evt);
+      }
+    };
+
+    const finishIterable = () => {
+      if (streamDone) return;
+      streamDone = true;
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: undefined as any, done: true });
+      }
+    };
+
+    let stdoutMeta: string | null = null;
+    let stderrSeen = false;
+    let resolveDone!: (v: { code: number; cwd: string }) => void;
+    let rejectDone!: (err: Error) => void;
+    const donePromise = new Promise<{ code: number; cwd: string }>(
+      (res, rej) => {
+        resolveDone = res;
+        rejectDone = rej;
+      },
+    );
+
+    const failWith = (err: Error) => {
+      streamError = err;
+      finishIterable();
+      release();
+      rejectDone(err);
+    };
+
+    const tryComplete = () => {
+      if (stdoutMeta === null || !stderrSeen) return;
+      const parsed = parseStdoutMeta(stdoutMeta);
+      finishIterable();
+      release();
+      if (!parsed) {
+        rejectDone(
+          new Error(`shell: malformed end-of-command marker: ${stdoutMeta}`),
+        );
+        return;
+      }
+      if (parsed.cwd) this.cwd = parsed.cwd;
+      resolveDone(parsed);
+    };
+
+    const stdoutProc = new MarkerProcessor(
+      marker,
+      (chunk) => pushEvent({ type: 'stdout', data: Buffer.from(chunk) }),
+      (meta) => {
+        stdoutMeta = meta;
+        tryComplete();
+      },
+      failWith,
+    );
+    const stderrProc = new MarkerProcessor(
+      marker,
+      (chunk) => pushEvent({ type: 'stderr', data: Buffer.from(chunk) }),
+      () => {
+        stderrSeen = true;
+        tryComplete();
+      },
+      failWith,
+    );
+
+    // Drive the underlying microsandbox stream in the background.
+    (async () => {
+      try {
+        const handle: ExecHandle = await this.inst.shellStream(wrapped);
+        while (true) {
+          const event: ExecEvent | null = await handle.recv();
+          if (event === null) break;
+          if (event.eventType === 'stdout' && event.data) {
+            stdoutProc.feed(Buffer.from(event.data));
+          } else if (event.eventType === 'stderr' && event.data) {
+            stderrProc.feed(Buffer.from(event.data));
+          }
+        }
+        // Stream closed before we saw both markers — surface as error.
+        if (!streamDone) {
+          stdoutProc.abort();
+          stderrProc.abort();
+        }
+      } catch (err) {
+        failWith(err as Error);
+      }
+    })();
+
+    const events: AsyncIterable<ExecStreamEvent> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next(): Promise<IteratorResult<ExecStreamEvent>> {
+            if (queue.length > 0) {
+              return Promise.resolve({ value: queue.shift()!, done: false });
+            }
+            if (streamError) return Promise.reject(streamError);
+            if (streamDone) {
+              return Promise.resolve({ value: undefined as any, done: true });
+            }
+            return new Promise((resolve) => {
+              pendingResolve = resolve;
+            });
+          },
+        };
+      },
+    };
+
+    return { events, done: donePromise };
+  }
+}
+
+/**
+ * One-shot marker extraction for the non-streaming `run()` path. Returns the
+ * portion of `raw` before the marker as `text`, plus the metadata that
+ * follows on the same line as `meta` (or null if the marker is absent).
+ */
+function stripMarker(
+  raw: string,
+  marker: string,
+): { text: string; meta?: string } {
+  const idx = raw.indexOf(marker);
+  if (idx === -1) return { text: raw };
+  const before = raw.slice(0, idx);
+  const after = raw.slice(idx + marker.length);
+  const nl = after.indexOf('\n');
+  const meta = nl === -1 ? after : after.slice(0, nl);
+  return { text: before, meta };
 }

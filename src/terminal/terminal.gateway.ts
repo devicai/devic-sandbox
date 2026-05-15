@@ -10,12 +10,12 @@ import { SandboxRegistry } from '../sandboxes/sandbox-registry';
 import {
   RUNTIME_PROVIDER,
   RuntimeProvider,
-  ExecStream,
+  ShellSession,
 } from '../runtime/runtime-provider.interface';
 
 interface ClientSession {
   sandboxId: string;
-  activeStream: ExecStream | null;
+  shell: ShellSession;
   alive: boolean;
 }
 
@@ -57,7 +57,11 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
     const session = this.sessions.get(client);
     if (session) {
       session.alive = false;
-      session.activeStream?.stop().catch(() => undefined);
+      // Intentionally NOT closing the shell here: it's shared across all
+      // consumers of this sandbox (terminal reconnects + agent exec calls)
+      // and tearing it down on every WebSocket close would forfeit the
+      // persistence guarantees (cwd, exports, shell state) we just bought.
+      // The shell is reclaimed when the sandbox is stopped or removed.
       this.sessions.delete(client);
       this.logger.log(`Terminal client disconnected (sandbox: ${session.sandboxId})`);
     }
@@ -70,9 +74,27 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
       return;
     }
 
+    const handle = await this.runtime.get(containerName);
+    if (!handle || handle.status !== 'running') {
+      this.send(client, { type: 'error', data: 'Sandbox is not running' });
+      return;
+    }
+
+    let shell: ShellSession;
+    try {
+      const sandbox = await handle.connect();
+      shell = await sandbox.openShell();
+    } catch (err) {
+      this.send(client, {
+        type: 'error',
+        data: `Failed to open shell: ${(err as Error).message}`,
+      });
+      return;
+    }
+
     this.sessions.set(client, {
       sandboxId,
-      activeStream: null,
+      shell,
       alive: true,
     });
 
@@ -89,21 +111,17 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
       return;
     }
 
-    const containerName = await this.registry.get(session.sandboxId);
-    if (!containerName) {
-      this.send(client, { type: 'error', data: 'Sandbox no longer available' });
+    if (session.shell.closed) {
+      this.send(client, {
+        type: 'error',
+        data: 'Shell session ended. Re-attach to start a new one.',
+      });
+      this.sessions.delete(client);
       return;
     }
 
     try {
-      const handle = await this.runtime.get(containerName);
-      if (!handle || handle.status !== 'running') {
-        this.send(client, { type: 'error', data: 'Sandbox is not running' });
-        return;
-      }
-      const sandbox = await handle.connect();
-      const stream = await sandbox.execStream(command);
-      session.activeStream = stream;
+      const stream = await session.shell.runStream(command);
 
       try {
         for await (const event of stream.events) {
@@ -113,11 +131,13 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
             data: event.data.toString('utf-8'),
           });
         }
-      } finally {
-        await stream.stop().catch(() => undefined);
-        if (session.activeStream === stream) {
-          session.activeStream = null;
-        }
+        await stream.done;
+      } catch (err) {
+        this.send(client, {
+          type: 'error',
+          data: `Command error: ${(err as Error).message}`,
+        });
+        return;
       }
 
       this.send(client, { type: 'done' });

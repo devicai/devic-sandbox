@@ -20,8 +20,6 @@ import {
   RuntimeSandbox,
 } from '../runtime/runtime-provider.interface';
 
-const CWD_MARKER = '__SANDBOX_CWD__';
-
 @Injectable()
 export class SandboxesService {
   private readonly logger = new Logger(SandboxesService.name);
@@ -259,37 +257,21 @@ export class SandboxesService {
 
     const sandbox = await this.getSandboxInstance(doc);
 
-    let command = dto.command.replace(/\bsudo\s+/g, '');
+    const command = dto.command.replace(/\bsudo\s+/g, '');
     const cwd = dto.cwd ?? doc.currentCwd ?? doc.workdir;
 
-    if (dto.env && Object.keys(dto.env).length > 0) {
-      const envPrefix = Object.entries(dto.env)
-        .map(([k, v]) => `export ${k}='${v.replace(/'/g, "'\\''")}'`)
-        .join('; ');
-      command = `${envPrefix}; ${command}`;
-    }
+    // Reuse the sandbox-scoped persistent shell so `export VAR=…`, shell
+    // functions and other in-shell state from previous tool calls remain
+    // visible. `cd` is also real and persists, but we still pin the starting
+    // cwd to whatever the caller asked for (or what we last recorded) so the
+    // shell's own drift doesn't surprise the agent.
+    const shell = await sandbox.openShell(cwd);
+    const result = await shell.run(command, {
+      cwd,
+      env: dto.env,
+    });
 
-    // Wrap the user command so we can:
-    //   (a) cd into the requested cwd before running it,
-    //   (b) print a marker line afterwards so we can detect if the command
-    //       itself changed cwd (e.g. `cd subdir`),
-    //   (c) preserve the user command's real exit code as the sh -c exit
-    //       code — `; echo …` would always make echo the last command and
-    //       mask non-zero exits like `false` (1) or missing binaries (127).
-    const fullCommand =
-      `cd '${cwd}' && { ${command}; __devic_ec=$?; ` +
-      `echo "${CWD_MARKER}$(pwd)"; exit $__devic_ec; }`;
-    const result = await sandbox.exec(fullCommand);
-    const stdout = result.stdout;
-    const stderr = result.stderr;
-
-    let newCwd = cwd;
-    const markerIdx = stdout.lastIndexOf(CWD_MARKER);
-    if (markerIdx !== -1) {
-      newCwd = stdout.substring(markerIdx + CWD_MARKER.length).trim();
-    }
-
-    const cleanStdout = markerIdx !== -1 ? stdout.substring(0, markerIdx) : stdout;
+    const newCwd = result.cwd || cwd;
 
     const recentCommands = [...(doc.recentCommands ?? []), dto.command].slice(-10);
     await this.sandboxRepo.updateById(
@@ -303,8 +285,8 @@ export class SandboxesService {
 
     return {
       code: result.code,
-      stdout: cleanStdout,
-      stderr,
+      stdout: result.stdout,
+      stderr: result.stderr,
       cwd: newCwd,
     };
   }

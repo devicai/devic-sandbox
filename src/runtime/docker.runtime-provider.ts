@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import Docker from 'dockerode';
 import * as tar from 'tar-stream';
 import { PassThrough, Readable } from 'stream';
@@ -23,7 +24,16 @@ import {
   RuntimeSandboxConfig,
   RuntimeStatus,
   SandboxAddress,
+  ShellRunOptions,
+  ShellRunResult,
+  ShellRunStream,
+  ShellSession,
 } from './runtime-provider.interface';
+import {
+  buildWrappedCommand,
+  MarkerProcessor,
+  parseStdoutMeta,
+} from './shell-protocol';
 
 /**
  * Bridge network name for a per-sandbox isolated network. Used only when the
@@ -42,6 +52,13 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly hardening: Required<DockerHardeningConfig>;
   private readonly ingressEnabled: boolean;
   private readonly selfContainerId: string | null;
+  /**
+   * Container-name -> DockerSandbox instance cache. We reuse the same instance
+   * across `connect()` / `start()` calls so the persistent shell session it
+   * may hold is not torn down between callers (terminal gateway and the
+   * agent-facing exec API share one shell per sandbox).
+   */
+  private readonly sandboxCache = new Map<string, DockerSandbox>();
 
   constructor(@Inject(CONFIG) private readonly config: ModuleConfig) {
     const docker = config.runtime.docker;
@@ -135,10 +152,41 @@ export class DockerRuntimeProvider implements RuntimeProvider {
 
     await container.start();
 
-    const sandbox = new DockerSandbox(cfg.name, container);
+    const sandbox = this.cacheSandbox(cfg.name, container);
     // Make sure the workdir exists. Some images ship without /workspace.
     await sandbox.exec(`mkdir -p ${shellEscape(cfg.workdir)}`);
     return sandbox;
+  }
+
+  /**
+   * Return the cached DockerSandbox for `name`, creating one if absent. The
+   * cache is keyed on the container name, so reattaching to an existing
+   * sandbox after a process restart will produce a fresh instance with no
+   * pre-existing shell — that is fine and intended.
+   */
+  private cacheSandbox(name: string, container: Docker.Container): DockerSandbox {
+    const cached = this.sandboxCache.get(name);
+    if (cached) return cached;
+    const fresh = new DockerSandbox(name, container);
+    this.sandboxCache.set(name, fresh);
+    return fresh;
+  }
+
+  /**
+   * Drop the cached sandbox (and any open shell session it owns) for `name`.
+   * Idempotent. Called whenever the container is removed or known to be gone.
+   */
+  private async evictSandbox(name: string): Promise<void> {
+    const cached = this.sandboxCache.get(name);
+    if (!cached) return;
+    this.sandboxCache.delete(name);
+    try {
+      await cached.disposeShell();
+    } catch (err) {
+      this.logger.debug(
+        `evictSandbox(${name}) shell dispose ignored: ${(err as Error).message}`,
+      );
+    }
   }
 
   async get(name: string): Promise<RuntimeHandle | null> {
@@ -155,7 +203,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     const status = mapStatus(info.State.Status);
     return {
       status,
-      connect: async () => new DockerSandbox(name, container),
+      connect: async () => this.cacheSandbox(name, container),
       start: async () => {
         if (info.State.Status !== 'running') {
           await container.start().catch((err: any) => {
@@ -163,12 +211,13 @@ export class DockerRuntimeProvider implements RuntimeProvider {
             if (err.statusCode !== 304) throw err;
           });
         }
-        return new DockerSandbox(name, container);
+        return this.cacheSandbox(name, container);
       },
     };
   }
 
   async remove(name: string): Promise<void> {
+    await this.evictSandbox(name);
     try {
       const container = this.docker.getContainer(name);
       await container.remove({ force: true, v: true });
@@ -305,6 +354,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   }
 
   private async removeIfExists(name: string): Promise<void> {
+    await this.evictSandbox(name);
     try {
       const c = this.docker.getContainer(name);
       await c.inspect();
@@ -374,10 +424,47 @@ function detectSelfContainerId(logger: Logger): string | null {
 }
 
 class DockerSandbox implements RuntimeSandbox {
+  /**
+   * Lazily-opened persistent shell session. Created by openShell() on first
+   * call and reused for subsequent ones. Cleared automatically when the shell
+   * process exits.
+   */
+  private shell: DockerShellSession | null = null;
+  private shellOpening: Promise<DockerShellSession> | null = null;
+
   constructor(
     readonly name: string,
     private readonly container: Docker.Container,
   ) {}
+
+  async openShell(initialCwd?: string): Promise<ShellSession> {
+    if (this.shell && !this.shell.closed) return this.shell;
+    // Coalesce concurrent openers.
+    if (this.shellOpening) return this.shellOpening;
+    this.shellOpening = (async () => {
+      const session = await DockerShellSession.open(this.container, initialCwd);
+      session.onClose(() => {
+        if (this.shell === session) this.shell = null;
+      });
+      this.shell = session;
+      return session;
+    })();
+    try {
+      return await this.shellOpening;
+    } finally {
+      this.shellOpening = null;
+    }
+  }
+
+  /**
+   * Tear down the open shell session, if any. Called by the runtime provider
+   * when the sandbox is being evicted from cache or removed.
+   */
+  async disposeShell(): Promise<void> {
+    const s = this.shell;
+    this.shell = null;
+    if (s) await s.close();
+  }
 
   async exec(command: string): Promise<ExecResult> {
     const exec = await this.container.exec({
@@ -541,6 +628,9 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async detach(): Promise<void> {
+    // Best-effort: tear the shell session down before stopping the container
+    // so we surface a clean close error rather than a half-broken stream.
+    await this.disposeShell().catch(() => undefined);
     try {
       await this.container.stop({ t: 10 });
     } catch (err: any) {
@@ -611,4 +701,277 @@ async function extractFirstFileToDisk(
     (stream as Readable).pipe(extract);
   });
 }
+
+/**
+ * Persistent shell session backed by a long-lived `docker exec /bin/sh` with
+ * stdin/stdout/stderr attached (Tty=false). Each `run()` writes a wrapped
+ * command into the same shell, so `export`, `cd`, shell functions, etc.
+ * persist across calls — agents observe a stable environment between tool
+ * invocations and human operators in the terminal see the same.
+ *
+ * End-of-command detection uses per-call UUID markers emitted on both stdout
+ * (with `:CODE:CWD\n` metadata) and stderr (bare `\n`). Output bytes prior to
+ * each marker are forwarded to the caller verbatim; the marker line itself is
+ * stripped. We base64-encode the user command to feed it into the shell so
+ * arbitrary content (quotes, newlines, the marker string, $-substitutions)
+ * cannot break the wrapper.
+ */
+class DockerShellSession implements ShellSession {
+  private readonly stdoutSink = new PassThrough();
+  private readonly stderrSink = new PassThrough();
+  private queue: Promise<unknown> = Promise.resolve();
+  private _closed = false;
+  private readonly closeListeners: Array<() => void> = [];
+  /** Currently-active per-command processors (null when idle between calls). */
+  private currentStdout: MarkerProcessor | null = null;
+  private currentStderr: MarkerProcessor | null = null;
+
+  private constructor(
+    private readonly exec: Docker.Exec,
+    private readonly stream: NodeJS.ReadWriteStream,
+    container: Docker.Container,
+  ) {
+    container.modem.demuxStream(stream, this.stdoutSink, this.stderrSink);
+
+    this.stdoutSink.on('data', (c: Buffer) => this.currentStdout?.feed(c));
+    this.stderrSink.on('data', (c: Buffer) => this.currentStderr?.feed(c));
+
+    const onEnd = (err?: Error) => this.markClosed(err);
+    stream.once('end', () => onEnd());
+    stream.once('close', () => onEnd());
+    stream.once('error', (err: Error) => onEnd(err));
+  }
+
+  /**
+   * Spawn a `/bin/sh` inside the container with stdin attached. The shell
+   * stays running until `close()` is called or the user runs `exit`.
+   */
+  static async open(
+    container: Docker.Container,
+    initialCwd?: string,
+  ): Promise<DockerShellSession> {
+    const exec = await container.exec({
+      Cmd: ['/bin/sh'],
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+    });
+    const stream = (await exec.start({
+      hijack: true,
+      stdin: true,
+    })) as unknown as NodeJS.ReadWriteStream;
+    const session = new DockerShellSession(exec, stream, container);
+    if (initialCwd && initialCwd.trim()) {
+      // Best-effort: position the shell at the requested cwd before any
+      // caller-issued command. Failures here surface on the first run().
+      await session.run(`cd ${shellEscape(initialCwd)}`).catch(() => undefined);
+    }
+    return session;
+  }
+
+  get closed(): boolean {
+    return this._closed;
+  }
+
+  onClose(listener: () => void): void {
+    if (this._closed) {
+      queueMicrotask(listener);
+      return;
+    }
+    this.closeListeners.push(listener);
+  }
+
+  private markClosed(err?: Error): void {
+    if (this._closed) return;
+    this._closed = true;
+    // Abort any in-flight processors.
+    this.currentStdout?.abort(err);
+    this.currentStderr?.abort(err);
+    this.currentStdout = null;
+    this.currentStderr = null;
+    for (const l of this.closeListeners.splice(0)) {
+      try {
+        l();
+      } catch {
+        // Listener errors must not poison the close path.
+      }
+    }
+  }
+
+  async run(command: string, opts?: ShellRunOptions): Promise<ShellRunResult> {
+    const s = await this.runStream(command, opts);
+    let stdout = '';
+    let stderr = '';
+    for await (const evt of s.events) {
+      if (evt.type === 'stdout') stdout += evt.data.toString('utf-8');
+      else stderr += evt.data.toString('utf-8');
+    }
+    const { code, cwd } = await s.done;
+    return { code, cwd, stdout, stderr };
+  }
+
+  async runStream(
+    command: string,
+    opts?: ShellRunOptions,
+  ): Promise<ShellRunStream> {
+    if (this._closed) {
+      throw new Error('Shell session is closed');
+    }
+
+    // Serialize: each command waits for the previous one to fully complete.
+    const previous = this.queue;
+    let releaseLock!: () => void;
+    const lock = new Promise<void>((res) => {
+      releaseLock = res;
+    });
+    this.queue = lock;
+    await previous.catch(() => undefined);
+
+    if (this._closed) {
+      releaseLock();
+      throw new Error('Shell session is closed');
+    }
+
+    const uuid = randomUUID().replace(/-/g, '');
+    const marker = `__DEVIC_END_${uuid}__`;
+    const wrapped = buildWrappedCommand(command, marker, opts);
+
+    const queue: ExecStreamEvent[] = [];
+    let pendingResolve:
+      | ((v: IteratorResult<ExecStreamEvent>) => void)
+      | null = null;
+    let streamDone = false;
+    let streamError: Error | null = null;
+
+    const pushEvent = (evt: ExecStreamEvent) => {
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: evt, done: false });
+      } else {
+        queue.push(evt);
+      }
+    };
+
+    const finishIterable = () => {
+      if (streamDone) return;
+      streamDone = true;
+      if (pendingResolve) {
+        const r = pendingResolve;
+        pendingResolve = null;
+        r({ value: undefined as any, done: true });
+      }
+    };
+
+    let stdoutMeta: string | null = null;
+    let stderrMeta: string | null = null;
+    let resolveDone!: (v: { code: number; cwd: string }) => void;
+    let rejectDone!: (err: Error) => void;
+    const donePromise = new Promise<{ code: number; cwd: string }>(
+      (res, rej) => {
+        resolveDone = res;
+        rejectDone = rej;
+      },
+    );
+
+    const tryComplete = () => {
+      if (stdoutMeta === null || stderrMeta === null) return;
+      // stdoutMeta has the form ":CODE:CWD"; stderrMeta is the bare line (empty).
+      const parsed = parseStdoutMeta(stdoutMeta);
+      finishIterable();
+      this.currentStdout = null;
+      this.currentStderr = null;
+      releaseLock();
+      if (!parsed) {
+        rejectDone(
+          new Error(`shell: malformed end-of-command marker: ${stdoutMeta}`),
+        );
+        return;
+      }
+      resolveDone(parsed);
+    };
+
+    const failWith = (err: Error) => {
+      streamError = err;
+      finishIterable();
+      this.currentStdout = null;
+      this.currentStderr = null;
+      releaseLock();
+      rejectDone(err);
+    };
+
+    this.currentStdout = new MarkerProcessor(
+      marker,
+      (chunk) =>
+        pushEvent({ type: 'stdout', data: Buffer.from(chunk) }),
+      (meta) => {
+        stdoutMeta = meta;
+        tryComplete();
+      },
+      failWith,
+    );
+    this.currentStderr = new MarkerProcessor(
+      marker,
+      (chunk) =>
+        pushEvent({ type: 'stderr', data: Buffer.from(chunk) }),
+      (meta) => {
+        stderrMeta = meta;
+        tryComplete();
+      },
+      failWith,
+    );
+
+    // Send the wrapped command into the shell. We append a newline so the
+    // shell parses the last statement.
+    try {
+      const ok = (this.stream as any).write(wrapped + '\n');
+      if (ok === false) {
+        await new Promise<void>((res) =>
+          (this.stream as any).once('drain', res),
+        );
+      }
+    } catch (err) {
+      failWith(err as Error);
+      throw err;
+    }
+
+    const events: AsyncIterable<ExecStreamEvent> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next(): Promise<IteratorResult<ExecStreamEvent>> {
+            if (queue.length > 0) {
+              return Promise.resolve({ value: queue.shift()!, done: false });
+            }
+            if (streamError) return Promise.reject(streamError);
+            if (streamDone) {
+              return Promise.resolve({ value: undefined as any, done: true });
+            }
+            return new Promise((resolve) => {
+              pendingResolve = resolve;
+            });
+          },
+        };
+      },
+    };
+
+    return { events, done: donePromise };
+  }
+
+  async close(): Promise<void> {
+    if (this._closed) return;
+    try {
+      (this.stream as any).end?.();
+    } catch {
+      // ignored — markClosed runs from the stream's `end` / `close` event.
+    }
+    try {
+      (this.stream as any).destroy?.();
+    } catch {
+      // ignored
+    }
+    this.markClosed();
+  }
+}
+
 

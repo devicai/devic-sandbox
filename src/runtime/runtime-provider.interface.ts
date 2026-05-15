@@ -37,6 +37,58 @@ export interface ExecStream {
   stop(): Promise<void>;
 }
 
+/**
+ * Persistent shell session bound to a single sandbox. Commands sent through
+ * the same session share environment, working directory, shell options, and
+ * any other in-shell state (functions, aliases) — so `export FOO=bar` in one
+ * call is visible to the next, and `cd subdir` actually moves the cwd.
+ *
+ * Implementations serialize concurrent calls per session; callers may queue
+ * commands freely without external locking.
+ */
+export interface ShellSession {
+  /** Run a command to completion and return aggregated stdout/stderr. */
+  run(command: string, opts?: ShellRunOptions): Promise<ShellRunResult>;
+  /**
+   * Run a command, streaming stdout/stderr as it arrives. `done` resolves with
+   * the final exit code and resulting cwd once the command finishes; the
+   * `events` iterable terminates at the same point.
+   */
+  runStream(command: string, opts?: ShellRunOptions): Promise<ShellRunStream>;
+  /** Tear the session down. Idempotent. */
+  close(): Promise<void>;
+  /** True once the underlying shell process has exited (e.g. user `exit`). */
+  readonly closed: boolean;
+}
+
+export interface ShellRunOptions {
+  /**
+   * Change directory before running the command. The shell `cd` is real and
+   * persists for subsequent calls in this session. Defaults to the session's
+   * current cwd.
+   */
+  cwd?: string;
+  /**
+   * Environment overrides scoped to this single command (exported inline
+   * before running). Use plain `export X=Y` inside a command if you want the
+   * value to persist across calls.
+   */
+  env?: Record<string, string>;
+}
+
+export interface ShellRunResult {
+  code: number;
+  /** cwd of the session after the command (reflects internal `cd`s). */
+  cwd: string;
+  stdout: string;
+  stderr: string;
+}
+
+export interface ShellRunStream {
+  events: AsyncIterable<ExecStreamEvent>;
+  done: Promise<{ code: number; cwd: string }>;
+}
+
 export type RuntimeStatus = 'running' | 'stopped' | 'unknown';
 
 /**
@@ -50,6 +102,14 @@ export interface RuntimeSandbox {
 
   /** Streaming command for interactive use (terminal gateway). */
   execStream(command: string): Promise<ExecStream>;
+
+  /**
+   * Open a persistent shell session whose env vars, cwd, shell functions and
+   * other shell state survive across calls. Same session may back both the
+   * agent-facing exec API and the interactive terminal, so they observe a
+   * consistent view of the sandbox.
+   */
+  openShell(initialCwd?: string): Promise<ShellSession>;
 
   /** Read a file from the sandbox filesystem. */
   readFile(path: string): Promise<Buffer>;
