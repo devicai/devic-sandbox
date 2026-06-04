@@ -26,6 +26,22 @@ export interface ExecResult {
   stderr: string;
 }
 
+/**
+ * A single filesystem change of a sandbox relative to the image it was created
+ * from. Mirrors `docker diff`:
+ *   - `'A'` added (path did not exist in the base image),
+ *   - `'C'` changed (path existed and was modified),
+ *   - `'D'` deleted (path existed in the base image and was removed).
+ *
+ * Used by full-filesystem snapshots so everything installed outside the workdir
+ * (apt/npm-g/pip packages, /usr/local/bin binaries, /etc configs) is captured,
+ * not just /workspace.
+ */
+export interface FsChange {
+  path: string;
+  kind: 'A' | 'C' | 'D';
+}
+
 export interface ExecStreamEvent {
   type: 'stdout' | 'stderr';
   data: Buffer;
@@ -99,6 +115,13 @@ export interface RuntimeSandbox {
 
   /** One-shot command. Resolves with full stdout/stderr/exitCode. */
   exec(command: string): Promise<ExecResult>;
+
+  /**
+   * List the sandbox filesystem changes relative to its base image (added /
+   * changed / deleted paths). Backs full-filesystem snapshots. Runtimes that
+   * cannot compute a diff throw an error.
+   */
+  diff(): Promise<FsChange[]>;
 
   /** Streaming command for interactive use (terminal gateway). */
   execStream(command: string): Promise<ExecStream>;

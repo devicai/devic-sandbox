@@ -10,6 +10,7 @@ import {
   ExecResult,
   ExecStream,
   ExecStreamEvent,
+  FsChange,
   RuntimeHandle,
   RuntimeProvider,
   RuntimeSandbox,
@@ -163,6 +164,15 @@ class MicrosandboxSandbox implements RuntimeSandbox {
       stdout: result.stdout(),
       stderr: result.stderr(),
     };
+  }
+
+  async diff(): Promise<FsChange[]> {
+    // The microsandbox SDK exposes no image-diff primitive, so full-filesystem
+    // snapshots are unsupported on this runtime (Docker is the runtime that
+    // backs them). Workdir-scoped snapshots do not call this.
+    throw new Error(
+      'Full-filesystem snapshots (diff) are not supported by the microsandbox runtime',
+    );
   }
 
   async execStream(command: string): Promise<ExecStream> {

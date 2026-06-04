@@ -12,6 +12,7 @@ export interface ModuleConfig {
   resourceLimits?: ResourceLimitsConfig;
   hotPool?: HotPoolConfig;
   ingress?: IngressConfig;
+  snapshots?: SnapshotsConfig;
 }
 
 export interface ServerConfig {
@@ -113,6 +114,42 @@ export interface WebhooksConfig {
 export interface LoggingConfig {
   level: 'debug' | 'info' | 'warn' | 'error';
   format: 'json' | 'pretty';
+}
+
+/**
+ * Snapshot behaviour. A snapshot can capture the whole filesystem diff vs the
+ * base image (`full` — installed packages, /usr/local/bin, /etc all survive a
+ * restore) or just the working directory (`workdir` — lighter, legacy). Full
+ * snapshots stay small by storing only the *diff* (compressed) and skipping
+ * regenerable caches.
+ */
+export interface SnapshotsConfig {
+  /** Scope used when a create request omits it. Default: 'full'. */
+  defaultScope?: 'full' | 'workdir';
+  /**
+   * Compression for full snapshots. The value also decides WHERE it runs:
+   *   - 'gzip' (and 'auto'): streamed inside the sandbox (`tar | gzip`) — CPU is
+   *     charged to the tenant's quota, no uncompressed staging, restore needs
+   *     only the universal gzip. Recommended default for a shared host.
+   *   - 'zstd': sandbox emits a plain tar and the HOST compresses with Node's
+   *     zlib (smaller artifacts, but unmetered host CPU + transient staging;
+   *     restore also decompresses host-side so the base image needn't have
+   *     zstd). Falls back to gzip if this Node build lacks zstd support.
+   * Default: 'auto'.
+   */
+  compression?: 'auto' | 'zstd' | 'gzip';
+  /**
+   * How aggressively to drop regenerable content from a full snapshot to save
+   * disk. 'conservative' (default) excludes package-manager caches; 'none'
+   * captures the diff verbatim; 'aggressive' additionally drops logs, residual
+   * tmp and man/doc.
+   */
+  cleanup?: 'conservative' | 'none' | 'aggressive';
+  /**
+   * Extra absolute path prefixes (or glob-ish suffixes like `**​/__pycache__`)
+   * to exclude from full snapshots, merged on top of the `cleanup` preset.
+   */
+  excludePaths?: string[];
 }
 
 export interface ResourceLimitsConfig {

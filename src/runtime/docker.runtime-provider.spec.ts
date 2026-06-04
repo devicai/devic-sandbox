@@ -313,6 +313,43 @@ describe('DockerRuntimeProvider', () => {
     });
   });
 
+  describe('diff', () => {
+    it('maps docker changes Kind to A/C/D', async () => {
+      const changes = jest.fn().mockResolvedValue([
+        { Path: '/usr/local/bin/cowsay', Kind: 1 }, // added
+        { Path: '/etc/profile', Kind: 0 }, // modified
+        { Path: '/workspace/old.txt', Kind: 2 }, // deleted
+      ]);
+      getContainer.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({ State: { Status: 'running' } }),
+        changes,
+      });
+
+      const provider = await buildProvider();
+      const handle = await provider.get('box');
+      const sandbox = await handle!.connect();
+      const result = await sandbox.diff();
+
+      expect(result).toEqual([
+        { path: '/usr/local/bin/cowsay', kind: 'A' },
+        { path: '/etc/profile', kind: 'C' },
+        { path: '/workspace/old.txt', kind: 'D' },
+      ]);
+    });
+
+    it('returns an empty array when docker reports no changes (null body)', async () => {
+      getContainer.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({ State: { Status: 'running' } }),
+        changes: jest.fn().mockResolvedValue(null),
+      });
+
+      const provider = await buildProvider();
+      const handle = await provider.get('box');
+      const sandbox = await handle!.connect();
+      expect(await sandbox.diff()).toEqual([]);
+    });
+  });
+
   describe('openShell', () => {
     /**
      * Stand up a provider whose `container.exec` produces a fake bidirectional

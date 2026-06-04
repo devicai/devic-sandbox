@@ -59,6 +59,25 @@ export class Snapshot {
   @Prop({ required: true })
   snapshotPath: string;
 
+  @ApiProperty({
+    description:
+      "What the tarball captures: 'full' (whole-filesystem diff vs base image) " +
+      "or 'workdir' (working directory only). New snapshots set this explicitly " +
+      "at create time; the default is 'workdir' so legacy documents that predate " +
+      'this field hydrate as workdir-only (their tarball is a workdir archive) ' +
+      'and restore correctly.',
+  })
+  @Prop({ default: 'workdir' })
+  scope: string;
+
+  @ApiProperty({
+    description:
+      "Compression codec of the tarball: 'zstd' or 'gzip'. Recorded at create " +
+      'time so restore decompresses with the matching tool.',
+  })
+  @Prop({ default: 'gzip' })
+  compression: string;
+
   @ApiProperty()
   @Prop({ default: 0 })
   sizeBytes: number;

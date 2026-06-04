@@ -80,6 +80,13 @@ export function loadConfig(configPath?: string): ModuleConfig {
   }
   resolved.mcp = resolved.mcp ?? { enabled: true };
 
+  resolved.snapshots = {
+    defaultScope: 'full',
+    compression: 'auto',
+    cleanup: 'conservative',
+    ...(resolved.snapshots ?? {}),
+  };
+
   resolved.hotPool = {
     enabled: false,
     memoryReservePercent: 0,

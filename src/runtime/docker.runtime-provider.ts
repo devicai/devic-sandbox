@@ -18,6 +18,7 @@ import {
   ExecResult,
   ExecStream,
   ExecStreamEvent,
+  FsChange,
   RuntimeHandle,
   RuntimeProvider,
   RuntimeSandbox,
@@ -498,6 +499,20 @@ class DockerSandbox implements RuntimeSandbox {
       stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
       stderr: Buffer.concat(stderrChunks).toString('utf-8'),
     };
+  }
+
+  async diff(): Promise<FsChange[]> {
+    // Docker returns the changed paths of the container's writable layer
+    // relative to its base image. The body is `null` (not `[]`) when nothing
+    // changed, so guard for it. Kind: 0=modified, 1=added, 2=deleted.
+    const changes = (await this.container.changes()) as
+      | Array<{ Path: string; Kind: number }>
+      | null;
+    if (!changes) return [];
+    return changes.map((c) => ({
+      path: c.Path,
+      kind: c.Kind === 2 ? 'D' : c.Kind === 1 ? 'A' : 'C',
+    }));
   }
 
   async execStream(command: string): Promise<ExecStream> {

@@ -7,8 +7,17 @@ import {
 } from '@nestjs/common';
 import { nanoid } from 'nanoid';
 import { join } from 'path';
-import { existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  statSync,
+  unlinkSync,
+  createReadStream,
+  createWriteStream,
+} from 'fs';
 import { homedir } from 'os';
+import * as zlib from 'zlib';
+import { pipeline } from 'stream/promises';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from '../sandboxes/sandbox-registry';
@@ -17,7 +26,7 @@ import { SandboxDocument, SandboxStatus } from '../schemas/sandbox.schema';
 import { ExtensionScope, PaginatedResponse } from '../interfaces';
 import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
-import { CreateSnapshotDto } from './dto/create-snapshot.dto';
+import { CreateSnapshotDto, SnapshotScope } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import {
@@ -25,8 +34,27 @@ import {
   RuntimeProvider,
   RuntimeSandbox,
 } from '../runtime/runtime-provider.interface';
+import {
+  buildExcludeMatcher,
+  partitionChanges,
+  isSafeDeletePath,
+  sh,
+} from './snapshot-fs.util';
 
 const SNAPSHOTS_DIR = join(homedir(), '.devic-sandbox', 'snapshots');
+
+/** zstd compression level for full-snapshot artifacts (disk-priority). */
+const ZSTD_LEVEL = 19;
+/** gzip level used when zstd is unavailable. */
+const GZIP_LEVEL = 9;
+/**
+ * Upper bound on how many delete paths we persist in the snapshot doc. Deletes
+ * of base-image files are rare; this guards the 16 MB Mongo doc limit. When
+ * exceeded we keep the first N and log — restore replays what it has.
+ */
+const MAX_PERSISTED_DELETES = 20000;
+
+type Codec = 'zstd' | 'gzip';
 
 @Injectable()
 export class SnapshotsService {
@@ -72,6 +100,41 @@ export class SnapshotsService {
     return stored;
   }
 
+  /**
+   * Pick the compression codec for full snapshots. The codec also decides WHERE
+   * compression runs:
+   *   - 'gzip' (default): streamed INSIDE the sandbox (`tar | gzip`), so the CPU
+   *     is charged to the tenant's cpu quota, nothing is staged uncompressed,
+   *     and restore only needs the universally-present gzip. Scales well on a
+   *     shared host.
+   *   - 'zstd' (opt-in): the sandbox emits a plain tar and the HOST compresses
+   *     it with Node's zlib. Smaller artifacts, but the CPU runs unmetered on
+   *     the shared host with a transient uncompressed staging file. Restore
+   *     decompresses host-side too, so the base image never needs zstd.
+   * 'auto' resolves to gzip (the safe default for a multitenant host).
+   */
+  private resolveCodec(): Codec {
+    const want = this.config.snapshots?.compression ?? 'auto';
+    if (want !== 'zstd') return 'gzip';
+    const hasZstd = typeof (zlib as any).createZstdCompress === 'function';
+    if (!hasZstd) {
+      this.logger.warn(
+        'snapshots.compression=zstd but this Node build has no zstd support; falling back to gzip',
+      );
+      return 'gzip';
+    }
+    return 'zstd';
+  }
+
+  private extFor(scope: SnapshotScope, codec: Codec): string {
+    if (scope === 'workdir') return 'tar.gz';
+    return codec === 'zstd' ? 'tar.zst' : 'tar.gz';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Create
+  // ---------------------------------------------------------------------------
+
   async create(
     dto: CreateSnapshotDto,
     scope: ExtensionScope,
@@ -86,14 +149,13 @@ export class SnapshotsService {
     await this.resourceUsage.assertDiskAvailable();
 
     const sandbox = await this.getSandboxInstance(sandboxDoc);
+    const captureScope: SnapshotScope =
+      dto.scope ?? this.config.snapshots?.defaultScope ?? 'full';
+    const codec: Codec = captureScope === 'full' ? this.resolveCodec() : 'gzip';
+
     const snapshotId = nanoid(12);
-    const snapshotFileName = `${snapshotId}.tar.gz`;
+    const snapshotFileName = `${snapshotId}.${this.extFor(captureScope, codec)}`;
     const snapshotPath = join(SNAPSHOTS_DIR, snapshotFileName);
-    // Stage the tarball inside workdir: sysbox-runc presents /tmp as a
-    // virtual mount that Docker's archive driver cannot read or write,
-    // so getArchive/putArchive against /tmp/* fails with "no such file".
-    // Workdir is created by Docker (WorkingDir) and is reachable.
-    const guestTarPath = `${sandboxDoc.workdir}/.devic-runtime-snapshot-${snapshotId}.tar.gz`;
 
     const doc = await this.snapshotRepo.create(
       {
@@ -104,6 +166,8 @@ export class SnapshotsService {
         status: SnapshotStatus.CREATING,
         image: sandboxDoc.image,
         workdir: sandboxDoc.workdir,
+        scope: captureScope,
+        compression: codec,
         cpus: sandboxDoc.cpus,
         memoryMib: sandboxDoc.memoryMib,
         envVars: sandboxDoc.envVars ?? {},
@@ -120,30 +184,30 @@ export class SnapshotsService {
 
     try {
       this.logger.log(
-        `Creating snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
+        `Creating ${captureScope} snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
       );
 
-      // No `--warning=no-file-changed`: that flag is GNU-only and busybox tar
-      // (alpine et al.) treats it as an unrecognized option, prints usage to
-      // stderr and silently produces no archive — leaving copyToHost to fail
-      // with a confusing "no such file" 404. GNU tar emits the mtime-changed
-      // warning to stderr instead, which is harmless; the archive is still
-      // valid and the code-1 exit it triggers is tolerated below.
-      const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} . && [ -s ${guestTarPath} ]`,
-      );
+      let deletes: string[] = [];
+      let captureMeta: Record<string, any> = {};
 
-      // Code 1 is tolerated (GNU tar's "file changed as we read it" warning).
-      // Higher codes mean a real tar failure OR the trailing `[ -s … ]` check
-      // tripped, i.e. tar swallowed an incompatible flag and produced nothing.
-      if (tarResult.code >= 2) {
-        throw new Error(
-          `Snapshot archive not produced (tar code=${tarResult.code}): ${tarResult.stderr || tarResult.stdout}`,
+      if (captureScope === 'full') {
+        const result = await this.captureFullToHost(
+          sandbox,
+          sandboxDoc.workdir,
+          snapshotId,
+          codec,
+          snapshotPath,
+        );
+        deletes = result.deletes;
+        captureMeta = result.stats;
+      } else {
+        await this.captureWorkdirToHost(
+          sandbox,
+          sandboxDoc.workdir,
+          snapshotId,
+          snapshotPath,
         );
       }
-
-      await sandbox.copyToHost(guestTarPath, snapshotPath);
-      await sandbox.exec(`rm -f ${guestTarPath}`);
 
       let sizeBytes = 0;
       try {
@@ -156,13 +220,19 @@ export class SnapshotsService {
           $set: {
             status: SnapshotStatus.READY,
             sizeBytes,
+            ...(captureScope === 'full'
+              ? {
+                  'metadata.deletes': this.capDeletes(deletes),
+                  'metadata.fullCapture': captureMeta,
+                }
+              : {}),
           },
         },
         scope,
       );
 
       this.logger.log(
-        `Snapshot ${snapshotId} created (${(sizeBytes / 1024).toFixed(1)} KB)`,
+        `Snapshot ${snapshotId} (${captureScope}/${codec}) created (${(sizeBytes / 1024).toFixed(1)} KB)`,
       );
 
       return updated!;
@@ -172,12 +242,20 @@ export class SnapshotsService {
         { $set: { status: SnapshotStatus.FAILED } },
         scope,
       );
+      // Best-effort cleanup of a partially written artifact.
+      try {
+        if (existsSync(snapshotPath)) unlinkSync(snapshotPath);
+      } catch {}
       this.logger.error(
         `Snapshot ${snapshotId} failed: ${(err as Error).message}`,
       );
       throw err;
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Restore
+  // ---------------------------------------------------------------------------
 
   async restore(
     snapshotId: string,
@@ -236,6 +314,12 @@ export class SnapshotsService {
       throw new BadRequestException('Snapshot file not found on disk');
     }
 
+    // Documents created before scoped snapshots existed have no `scope` field;
+    // they are workdir-only tarballs, so default reads to 'workdir'.
+    const restoreScope: SnapshotScope =
+      (snapshot.scope as SnapshotScope) ?? 'workdir';
+    const codec: Codec = (snapshot.compression as Codec) ?? 'gzip';
+
     const defaults = this.config.defaults;
     const sandboxId = nanoid(12);
     const containerName = `sandbox-${sandboxId}`;
@@ -292,18 +376,21 @@ export class SnapshotsService {
       });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
 
-      // Stage inside workdir; /tmp is unreachable via Docker archive APIs
-      // when sysbox-runc is the runtime (see snapshot create for context).
-      const guestTarPath = `${snapshot.workdir}/.devic-runtime-restore-${sandboxId}.tar.gz`;
-      await sandbox.copyFromHost(onDiskPath, guestTarPath);
-
-      const extractResult = await sandbox.exec(
-        `tar xzf ${guestTarPath} -C ${snapshot.workdir} && rm -f ${guestTarPath}`,
-      );
-
-      if (extractResult.code !== 0) {
-        this.logger.warn(
-          `Snapshot restore extraction warning: ${extractResult.stderr}`,
+      if (restoreScope === 'full') {
+        await this.restoreFull(
+          sandbox,
+          snapshot.workdir,
+          sandboxId,
+          onDiskPath,
+          codec,
+          (snapshot.metadata?.deletes as string[]) ?? [],
+        );
+      } else {
+        await this.restoreWorkdir(
+          sandbox,
+          snapshot.workdir,
+          sandboxId,
+          onDiskPath,
         );
       }
 
@@ -314,7 +401,7 @@ export class SnapshotsService {
       );
 
       this.logger.log(
-        `Sandbox ${sandboxId} restored from snapshot ${snapshotId}`,
+        `Sandbox ${sandboxId} restored from ${restoreScope} snapshot ${snapshotId}`,
       );
 
       const updated = await this.sandboxRepo.findById(
@@ -373,6 +460,7 @@ export class SnapshotsService {
   /**
    * Persist the current sandbox filesystem state back to its linked snapshot.
    * Called automatically when a snapshot-linked sandbox is stopped or expires.
+   * Re-captures with the same scope/codec the snapshot was created with.
    */
   async persistToSnapshot(sandboxDoc: SandboxDocument): Promise<void> {
     if (!sandboxDoc.snapshotId) return;
@@ -394,11 +482,13 @@ export class SnapshotsService {
       return;
     }
 
-    const guestTarPath = `${sandboxDoc.workdir}/.devic-runtime-persist-${sandboxDoc.sandboxId}.tar.gz`;
+    const persistScope: SnapshotScope =
+      (snapshotDoc.scope as SnapshotScope) ?? 'workdir';
+    const codec: Codec = (snapshotDoc.compression as Codec) ?? 'gzip';
 
     try {
       this.logger.log(
-        `Persisting sandbox ${sandboxDoc.sandboxId} to snapshot ${snapshotDoc.snapshotId}...`,
+        `Persisting sandbox ${sandboxDoc.sandboxId} to ${persistScope} snapshot ${snapshotDoc.snapshotId}...`,
       );
 
       const containerName =
@@ -412,22 +502,11 @@ export class SnapshotsService {
       }
       const sandbox = await handle.connect();
 
-      // See snapshot create for the rationale on dropping --warning and on
-      // verifying the archive exists post-tar.
-      const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} . && [ -s ${guestTarPath} ]`,
-      );
-
-      if (tarResult.code >= 2) {
-        this.logger.error(
-          `Persist tar failed (code=${tarResult.code}): ${tarResult.stderr || tarResult.stdout}`,
-        );
-        return;
-      }
-
       // Always write to the canonical (current) location even if the snapshot
       // was originally created under the legacy path.
-      const targetPath = snapshotDoc.snapshotPath.includes('/.microsandbox/snapshots/')
+      const targetPath = snapshotDoc.snapshotPath.includes(
+        '/.microsandbox/snapshots/',
+      )
         ? snapshotDoc.snapshotPath.replace(
             '/.microsandbox/snapshots/',
             '/.devic-sandbox/snapshots/',
@@ -438,8 +517,27 @@ export class SnapshotsService {
         mkdirSync(SNAPSHOTS_DIR, { recursive: true });
       }
 
-      await sandbox.copyToHost(guestTarPath, targetPath);
-      await sandbox.exec(`rm -f ${guestTarPath}`);
+      let deletes: string[] = [];
+      let captureMeta: Record<string, any> = {};
+
+      if (persistScope === 'full') {
+        const result = await this.captureFullToHost(
+          sandbox,
+          sandboxDoc.workdir,
+          sandboxDoc.sandboxId,
+          codec,
+          targetPath,
+        );
+        deletes = result.deletes;
+        captureMeta = result.stats;
+      } else {
+        await this.captureWorkdirToHost(
+          sandbox,
+          sandboxDoc.workdir,
+          sandboxDoc.sandboxId,
+          targetPath,
+        );
+      }
 
       // If we migrated the path, drop the legacy file to avoid drift.
       if (
@@ -465,6 +563,12 @@ export class SnapshotsService {
             'metadata.lastPersistedFrom': sandboxDoc.sandboxId,
             'metadata.lastPersistedAt': new Date().toISOString(),
             'metadata.currentCwd': sandboxDoc.currentCwd,
+            ...(persistScope === 'full'
+              ? {
+                  'metadata.deletes': this.capDeletes(deletes),
+                  'metadata.fullCapture': captureMeta,
+                }
+              : {}),
           },
         },
         {},
@@ -478,6 +582,340 @@ export class SnapshotsService {
         `Failed to persist snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
       );
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capture / restore implementations
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Workdir-only capture (legacy behaviour). Lightweight tar.gz of the working
+   * directory, produced inside the sandbox. Kept byte-for-byte compatible with
+   * pre-existing snapshots.
+   */
+  private async captureWorkdirToHost(
+    sandbox: RuntimeSandbox,
+    workdir: string,
+    id: string,
+    hostPath: string,
+  ): Promise<void> {
+    const guestTarPath = `${workdir}/.devic-runtime-snapshot-${id}.tar.gz`;
+
+    // No `--warning=no-file-changed`: that flag is GNU-only and busybox tar
+    // (alpine et al.) treats it as an unrecognized option, prints usage to
+    // stderr and silently produces no archive. GNU tar emits the mtime-changed
+    // warning to stderr instead, which is harmless; the code-1 exit it triggers
+    // is tolerated below.
+    const tarResult = await sandbox.exec(
+      `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${workdir} . && [ -s ${guestTarPath} ]`,
+    );
+
+    if (tarResult.code >= 2) {
+      throw new Error(
+        `Snapshot archive not produced (tar code=${tarResult.code}): ${tarResult.stderr || tarResult.stdout}`,
+      );
+    }
+
+    await sandbox.copyToHost(guestTarPath, hostPath);
+    await sandbox.exec(`rm -f ${guestTarPath}`);
+  }
+
+  /**
+   * Build the shell that tars the listed paths to `outputArgs` (e.g. `-cf -` to
+   * stream, or `-cf "$RAW"` to a file), capturing tar's real exit code into
+   * `rcPath` even when it runs inside a pipe. GNU tar uses `--no-recursion` so
+   * directory members keep their metadata without pulling unchanged children;
+   * busybox/alpine tar (no `--no-recursion`) gets a pre-filtered list with real
+   * directories dropped (parents are recreated on extract).
+   */
+  private tarEmitBlock(
+    listPath: string,
+    filesPath: string,
+    rcPath: string,
+    outputArgs: string,
+  ): string {
+    return [
+      `if tar --version 2>/dev/null | grep -qi 'GNU tar'; then`,
+      `  ( tar --no-recursion -T ${sh(listPath)} ${outputArgs} ; echo $? > ${sh(rcPath)} )`,
+      `else`,
+      `  while IFS= read -r p; do if [ -d "/$p" ] && [ ! -L "/$p" ]; then :; else printf '%s\\n' "$p"; fi; done < ${sh(listPath)} > ${sh(filesPath)}`,
+      `  ( tar -T ${sh(filesPath)} ${outputArgs} ; echo $? > ${sh(rcPath)} )`,
+      `fi`,
+    ].join('\n');
+  }
+
+  /**
+   * Full-filesystem capture. Archives only the paths `docker diff` reports as
+   * changed/added (minus excluded caches). For gzip (default) it compresses in
+   * a single streamed pass INSIDE the sandbox (`tar | gzip`) and copies the
+   * compressed artifact out — metered, no uncompressed staging. For zstd it
+   * emits a plain tar, copies it out and compresses host-side. Returns deleted
+   * paths (to replay on restore) plus capture stats.
+   */
+  private async captureFullToHost(
+    sandbox: RuntimeSandbox,
+    workdir: string,
+    id: string,
+    codec: Codec,
+    hostPath: string,
+  ): Promise<{ deletes: string[]; stats: Record<string, any> }> {
+    const cleanup = this.config.snapshots?.cleanup ?? 'conservative';
+    const isExcluded = buildExcludeMatcher({
+      cleanup,
+      extra: this.config.snapshots?.excludePaths,
+    });
+
+    const changes = await sandbox.diff();
+    const { present, deletes, excludedCount } = partitionChanges(
+      changes,
+      isExcluded,
+    );
+
+    const listPath = `${workdir}/.devic-runtime-snaplist-${id}`;
+    const filesPath = `${workdir}/.devic-runtime-snapfiles-${id}`;
+    const rcPath = `${workdir}/.devic-runtime-snaprc-${id}`;
+    const safeDeletes = deletes.filter(isSafeDeletePath);
+
+    // Degenerate case: nothing changed vs the base image. tar refuses to build
+    // an empty archive, so write a sentinel file, include it, and mark it for
+    // deletion on restore so it leaves no trace.
+    if (present.length === 0) {
+      const sentinelRel = `.devic-runtime-snapsentinel-${id}`;
+      await sandbox.exec(`: > ${sh(`${workdir}/${sentinelRel}`)}`);
+      present.push(`${workdir.replace(/^\/+/, '')}/${sentinelRel}`);
+      safeDeletes.push(`${workdir}/${sentinelRel}`);
+    }
+
+    await sandbox.writeFile(
+      listPath,
+      Buffer.from(present.join('\n') + '\n', 'utf-8'),
+    );
+
+    const cleanupCmd = `rm -f ${sh(listPath)} ${sh(filesPath)} ${sh(rcPath)}`;
+
+    if (codec === 'gzip') {
+      // Stream tar -> gzip in one pass; no uncompressed staging. The compound
+      // is grouped so the whole thing pipes into gzip; tar's rc is recovered
+      // from rcPath (rc=1 is a benign "file changed while reading" warning).
+      const guestGz = `${workdir}/.devic-runtime-snapshot-${id}.tar.gz`;
+      const script = [
+        'set -u',
+        'cd / || exit 90',
+        `{ ${this.tarEmitBlock(listPath, filesPath, rcPath, '-cf -')} ; } | gzip -c > ${sh(guestGz)}`,
+        `rc=$(cat ${sh(rcPath)} 2>/dev/null || echo 99)`,
+        cleanupCmd,
+        `if [ "$rc" -ge 2 ]; then echo "tar rc=$rc" >&2; rm -f ${sh(guestGz)}; exit "$rc"; fi`,
+        `[ -s ${sh(guestGz)} ] || { echo "empty archive" >&2; exit 5; }`,
+        'echo OK',
+      ].join('\n');
+
+      const res = await sandbox.exec(script);
+      if (res.code >= 2) {
+        throw new Error(
+          `Full snapshot tar failed (code=${res.code}): ${res.stderr || res.stdout}`,
+        );
+      }
+      await sandbox.copyToHost(guestGz, hostPath);
+      await sandbox.exec(`rm -f ${sh(guestGz)}`);
+
+      return {
+        deletes: safeDeletes,
+        stats: {
+          changed: present.length,
+          deleted: safeDeletes.length,
+          excluded: excludedCount,
+          codec,
+          where: 'sandbox',
+        },
+      };
+    }
+
+    // zstd: emit a plain tar in the sandbox, compress host-side.
+    const rawTar = `${workdir}/.devic-runtime-snapraw-${id}.tar`;
+    const script = [
+      'set -u',
+      'cd / || exit 90',
+      this.tarEmitBlock(listPath, filesPath, rcPath, `-cf ${sh(rawTar)}`),
+      `rc=$(cat ${sh(rcPath)} 2>/dev/null || echo 99)`,
+      cleanupCmd,
+      `if [ "$rc" -ge 2 ]; then echo "tar rc=$rc" >&2; rm -f ${sh(rawTar)}; exit "$rc"; fi`,
+      `[ -s ${sh(rawTar)} ] || { echo "empty raw tar" >&2; exit 5; }`,
+      'echo OK',
+    ].join('\n');
+
+    const res = await sandbox.exec(script);
+    if (res.code >= 2) {
+      throw new Error(
+        `Full snapshot tar failed (code=${res.code}): ${res.stderr || res.stdout}`,
+      );
+    }
+
+    const rawHost = `${hostPath}.rawtar`;
+    await sandbox.copyToHost(rawTar, rawHost);
+    await sandbox.exec(`rm -f ${sh(rawTar)}`);
+
+    let rawBytes = 0;
+    try {
+      rawBytes = statSync(rawHost).size;
+    } catch {}
+
+    try {
+      await this.compressFile(rawHost, hostPath, codec);
+    } finally {
+      try {
+        unlinkSync(rawHost);
+      } catch {}
+    }
+
+    return {
+      deletes: safeDeletes,
+      stats: {
+        changed: present.length,
+        deleted: safeDeletes.length,
+        excluded: excludedCount,
+        rawBytes,
+        codec,
+        where: 'host',
+      },
+    };
+  }
+
+  /** Restore a workdir-only snapshot (legacy path): extract tar.gz into workdir. */
+  private async restoreWorkdir(
+    sandbox: RuntimeSandbox,
+    workdir: string,
+    sandboxId: string,
+    onDiskPath: string,
+  ): Promise<void> {
+    const guestTarPath = `${workdir}/.devic-runtime-restore-${sandboxId}.tar.gz`;
+    await sandbox.copyFromHost(onDiskPath, guestTarPath);
+
+    const extractResult = await sandbox.exec(
+      `tar xzf ${guestTarPath} -C ${workdir} && rm -f ${guestTarPath}`,
+    );
+    if (extractResult.code !== 0) {
+      this.logger.warn(
+        `Snapshot restore extraction warning: ${extractResult.stderr}`,
+      );
+    }
+  }
+
+  /**
+   * Restore a full snapshot into the fresh (base-image) sandbox: extract the
+   * diff at `/` preserving perms, then replay deletes. For gzip the compressed
+   * artifact is pushed straight in and extracted with `tar -xzpf` (gzip is
+   * universal). For zstd the host decompresses to a plain tar first, so the
+   * base image never needs a zstd binary. `rm -rf` of deletes is guarded to
+   * concrete absolute paths.
+   */
+  private async restoreFull(
+    sandbox: RuntimeSandbox,
+    workdir: string,
+    sandboxId: string,
+    onDiskPath: string,
+    codec: Codec,
+    deletes: string[],
+  ): Promise<void> {
+    const safe = (deletes ?? []).filter(isSafeDeletePath);
+    const delListPath = `${workdir}/.devic-runtime-deletes-${sandboxId}`;
+    const deletesCmd = safe.length
+      ? `if [ -f ${sh(delListPath)} ]; then while IFS= read -r p; do case "$p" in /|"") ;; *) rm -rf "$p";; esac; done < ${sh(delListPath)}; rm -f ${sh(delListPath)}; fi`
+      : ':';
+
+    const runExtract = async (guestTarPath: string, tarFlags: string) => {
+      if (safe.length) {
+        await sandbox.writeFile(
+          delListPath,
+          Buffer.from(safe.join('\n') + '\n', 'utf-8'),
+        );
+      }
+      const script = [
+        'set -u',
+        'cd / || exit 90',
+        `T=${sh(guestTarPath)}`,
+        `tar ${tarFlags} "$T"; rc=$?`,
+        `rm -f "$T"`,
+        `if [ "$rc" -ge 2 ]; then echo "extract rc=$rc" >&2; fi`,
+        deletesCmd,
+        'echo OK',
+      ].join('\n');
+      const res = await sandbox.exec(script);
+      if (res.code >= 2) {
+        this.logger.warn(
+          `Full snapshot restore extraction warning: ${res.stderr}`,
+        );
+      }
+    };
+
+    if (codec === 'gzip') {
+      // Push the compressed artifact straight in; gzip extract is universal.
+      const guestGz = `${workdir}/.devic-runtime-restore-${sandboxId}.tar.gz`;
+      await sandbox.copyFromHost(onDiskPath, guestGz);
+      await runExtract(guestGz, '-xzpf');
+      return;
+    }
+
+    // zstd: decompress host-side to a plain tar, then push + extract plain.
+    const rawHost = `${onDiskPath}.restoretar`;
+    try {
+      await this.decompressFile(onDiskPath, rawHost, codec);
+      const guestTarPath = `${workdir}/.devic-runtime-restore-${sandboxId}.tar`;
+      await sandbox.copyFromHost(rawHost, guestTarPath);
+      await runExtract(guestTarPath, '-xpf');
+    } finally {
+      try {
+        unlinkSync(rawHost);
+      } catch {}
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host-side (de)compression — streamed so large diffs don't block or buffer.
+  // ---------------------------------------------------------------------------
+
+  private async compressFile(
+    srcTar: string,
+    destPath: string,
+    codec: Codec,
+  ): Promise<void> {
+    const transform =
+      codec === 'zstd'
+        ? (zlib as any).createZstdCompress({
+            params: {
+              [(zlib as any).constants.ZSTD_c_compressionLevel]: ZSTD_LEVEL,
+            },
+          })
+        : zlib.createGzip({ level: GZIP_LEVEL });
+    await pipeline(
+      createReadStream(srcTar),
+      transform,
+      createWriteStream(destPath),
+    );
+  }
+
+  private async decompressFile(
+    srcPath: string,
+    destTar: string,
+    codec: Codec,
+  ): Promise<void> {
+    const transform =
+      codec === 'zstd'
+        ? (zlib as any).createZstdDecompress()
+        : zlib.createGunzip();
+    await pipeline(
+      createReadStream(srcPath),
+      transform,
+      createWriteStream(destTar),
+    );
+  }
+
+  /** Trim a delete list to the persisted cap, warning when truncated. */
+  private capDeletes(deletes: string[]): string[] {
+    if (deletes.length <= MAX_PERSISTED_DELETES) return deletes;
+    this.logger.warn(
+      `Snapshot has ${deletes.length} deletes; persisting only the first ${MAX_PERSISTED_DELETES}`,
+    );
+    return deletes.slice(0, MAX_PERSISTED_DELETES);
   }
 
   private async findSandbox(
@@ -512,4 +950,3 @@ export class SnapshotsService {
     }
   }
 }
-
