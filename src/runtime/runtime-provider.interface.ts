@@ -120,6 +120,12 @@ export interface RuntimeSandbox {
    * List the sandbox filesystem changes relative to its base image (added /
    * changed / deleted paths). Backs full-filesystem snapshots. Runtimes that
    * cannot compute a diff throw an error.
+   *
+   * The Docker implementation adapts to the OCI runtime: under `runc` it uses
+   * `docker diff` directly; under `sysbox-runc` (where `docker diff` is blind to
+   * sysbox's internally-mounted /usr,/etc,/lib,/var) it computes the diff from
+   * inside the container against a baseline manifest of the image. See
+   * DockerSandbox.diff() / sysbox-diff.util.
    */
   diff(): Promise<FsChange[]>;
 

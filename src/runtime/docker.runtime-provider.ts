@@ -16,6 +16,11 @@ import { CONFIG } from '../config/config.loader';
 import { DockerHardeningConfig, ModuleConfig } from '../config/config.types';
 import { isImageAllowed } from './admission.util';
 import {
+  buildManifestFindCommand,
+  diffManifests,
+  parseManifest,
+} from './sysbox-diff.util';
+import {
   ExecResult,
   ExecStream,
   ExecStreamEvent,
@@ -67,6 +72,16 @@ export class DockerRuntimeProvider implements RuntimeProvider {
    * agent-facing exec API share one shell per sandbox).
    */
   private readonly sandboxCache = new Map<string, DockerSandbox>();
+  /**
+   * Per-image baseline filesystem manifest (path→size), used only under
+   * sysbox-runc to diff a sandbox against a fresh container of its base image.
+   * Built lazily on first full snapshot of an image and reused thereafter.
+   */
+  private readonly baseManifestCache = new Map<string, Map<string, number>>();
+  private readonly baseManifestInFlight = new Map<
+    string,
+    Promise<Map<string, number>>
+  >();
 
   constructor(@Inject(CONFIG) private readonly config: ModuleConfig) {
     const docker = config.runtime.docker;
@@ -244,9 +259,64 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private cacheSandbox(name: string, container: Docker.Container): DockerSandbox {
     const cached = this.sandboxCache.get(name);
     if (cached) return cached;
-    const fresh = new DockerSandbox(name, container);
+    const fresh = new DockerSandbox(name, container, {
+      runtime: this.runtime,
+      getBaseManifest: (image) => this.getBaseManifest(image),
+    });
     this.sandboxCache.set(name, fresh);
     return fresh;
+  }
+
+  /**
+   * Baseline (path→size) manifest of a fresh sysbox container of `image`,
+   * cached per image. Used to cancel sysbox's deterministic file injection so a
+   * sandbox's diff is exactly the user's changes. Concurrent callers coalesce.
+   */
+  private async getBaseManifest(image: string): Promise<Map<string, number>> {
+    const cached = this.baseManifestCache.get(image);
+    if (cached) return cached;
+    const inFlight = this.baseManifestInFlight.get(image);
+    if (inFlight) return inFlight;
+    const build = this.buildBaseManifest(image)
+      .then((m) => {
+        this.baseManifestCache.set(image, m);
+        return m;
+      })
+      .finally(() => this.baseManifestInFlight.delete(image));
+    this.baseManifestInFlight.set(image, build);
+    return build;
+  }
+
+  /**
+   * Run a throwaway sysbox container of `image` and capture its filesystem
+   * manifest. Must use the SAME runtime as the sandboxes (so the injected files
+   * match) and the SAME find command. A short settle delay lets sysbox finish
+   * its internal setup before the walk.
+   */
+  private async buildBaseManifest(image: string): Promise<Map<string, number>> {
+    const cmd = `sleep 8; ${buildManifestFindCommand()}`;
+    const container = await this.docker.createContainer({
+      Image: image,
+      Entrypoint: ['sh', '-c'],
+      Cmd: [cmd],
+      Tty: true, // raw stdout, no stream demuxing needed
+      HostConfig: { Runtime: this.runtime, AutoRemove: false },
+      Labels: {
+        'devic-sandbox.managed': 'true',
+        'devic-sandbox.baseline': 'true',
+      },
+    });
+    try {
+      await container.start();
+      await container.wait();
+      const buf = (await container.logs({
+        stdout: true,
+        stderr: false,
+      })) as unknown as Buffer;
+      return parseManifest(buf.toString('utf-8'));
+    } finally {
+      await container.remove({ force: true }).catch(() => undefined);
+    }
   }
 
   /**
@@ -532,6 +602,16 @@ function detectSelfContainerId(logger: Logger): string | null {
   return null;
 }
 
+/**
+ * Provider-supplied context a DockerSandbox needs beyond its own container:
+ * the active OCI runtime (so diff() can adapt) and a way to obtain the cached
+ * base-image manifest for the sysbox diff path.
+ */
+interface DockerSandboxContext {
+  runtime: string;
+  getBaseManifest(image: string): Promise<Map<string, number>>;
+}
+
 class DockerSandbox implements RuntimeSandbox {
   /**
    * Lazily-opened persistent shell session. Created by openShell() on first
@@ -544,6 +624,7 @@ class DockerSandbox implements RuntimeSandbox {
   constructor(
     readonly name: string,
     private readonly container: Docker.Container,
+    private readonly ctx: DockerSandboxContext,
   ) {}
 
   async openShell(initialCwd?: string): Promise<ShellSession> {
@@ -610,6 +691,26 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async diff(): Promise<FsChange[]> {
+    // Under sysbox-runc, `docker diff` is blind to changes in sysbox's
+    // internally-mounted system dirs (/usr, /etc, /lib, /var) — it would report
+    // only /root, /home and the workdir, silently dropping installed packages
+    // and configs. Verified A/B on one daemon: runc reports every change,
+    // sysbox reports ~2 of 9. So under sysbox we compute the diff from inside
+    // the container (where the fs is fully merged) against a baseline of a fresh
+    // sysbox container of the same image. See sysbox-diff.util for the details.
+    if (this.ctx.runtime === 'sysbox-runc') {
+      try {
+        return await this.diffViaBaseManifest();
+      } catch (err) {
+        // Never fail a snapshot over the diff strategy: fall back to docker
+        // diff (incomplete under sysbox, but better than throwing).
+        new Logger(DockerSandbox.name).warn(
+          `sysbox manifest diff failed for ${this.name}, falling back to ` +
+            `docker diff: ${(err as Error).message}`,
+        );
+      }
+    }
+
     // Docker returns the changed paths of the container's writable layer
     // relative to its base image. The body is `null` (not `[]`) when nothing
     // changed, so guard for it. Kind: 0=modified, 1=added, 2=deleted.
@@ -621,6 +722,25 @@ class DockerSandbox implements RuntimeSandbox {
       path: c.Path,
       kind: c.Kind === 2 ? 'D' : c.Kind === 1 ? 'A' : 'C',
     }));
+  }
+
+  /**
+   * sysbox-runc diff: walk the live container's filesystem from inside (exec
+   * sees the merged view) and compare against the cached baseline manifest of a
+   * fresh container of the same base image. The difference is exactly the user's
+   * changes — sysbox's deterministic file injection cancels out.
+   */
+  private async diffViaBaseManifest(): Promise<FsChange[]> {
+    const info = await this.container.inspect();
+    const image = info.Config?.Image || info.Image;
+    if (!image) throw new Error('could not resolve base image for diff');
+    const base = await this.ctx.getBaseManifest(image);
+    const out = await this.exec(buildManifestFindCommand());
+    const current = parseManifest(out.stdout);
+    if (current.size === 0) {
+      throw new Error('live manifest walk returned no entries');
+    }
+    return diffManifests(base, current);
   }
 
   async execStream(command: string): Promise<ExecStream> {

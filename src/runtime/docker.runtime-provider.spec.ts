@@ -421,7 +421,14 @@ describe('DockerRuntimeProvider', () => {
   });
 
   describe('diff', () => {
-    it('maps docker changes Kind to A/C/D', async () => {
+    // runtime=runc → diff() uses `docker diff` (container.changes()) directly.
+    const runcCfg = () =>
+      buildConfig({
+        type: 'docker',
+        docker: { runtime: 'runc', network: 'bridge' },
+      });
+
+    it('maps docker changes Kind to A/C/D (runc)', async () => {
       const changes = jest.fn().mockResolvedValue([
         { Path: '/usr/local/bin/cowsay', Kind: 1 }, // added
         { Path: '/etc/profile', Kind: 0 }, // modified
@@ -432,7 +439,7 @@ describe('DockerRuntimeProvider', () => {
         changes,
       });
 
-      const provider = await buildProvider();
+      const provider = await buildProvider(runcCfg());
       const handle = await provider.get('box');
       const sandbox = await handle!.connect();
       const result = await sandbox.diff();
@@ -444,16 +451,35 @@ describe('DockerRuntimeProvider', () => {
       ]);
     });
 
-    it('returns an empty array when docker reports no changes (null body)', async () => {
+    it('returns an empty array when docker reports no changes (null body, runc)', async () => {
       getContainer.mockReturnValue({
         inspect: jest.fn().mockResolvedValue({ State: { Status: 'running' } }),
         changes: jest.fn().mockResolvedValue(null),
       });
 
-      const provider = await buildProvider();
+      const provider = await buildProvider(runcCfg());
       const handle = await provider.get('box');
       const sandbox = await handle!.connect();
       expect(await sandbox.diff()).toEqual([]);
+    });
+
+    it('falls back to docker diff under sysbox when the manifest walk fails', async () => {
+      // inspect lacks Config.Image → diffViaBaseManifest throws → fallback to
+      // container.changes(). Proves the sysbox branch is guarded and never
+      // fails a snapshot over the diff strategy.
+      const changes = jest
+        .fn()
+        .mockResolvedValue([{ Path: '/root/x', Kind: 1 }]);
+      getContainer.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({ State: { Status: 'running' } }),
+        changes,
+      });
+
+      const provider = await buildProvider(); // default runtime = sysbox-runc
+      const handle = await provider.get('box');
+      const sandbox = await handle!.connect();
+      expect(await sandbox.diff()).toEqual([{ path: '/root/x', kind: 'A' }]);
+      expect(changes).toHaveBeenCalled();
     });
   });
 

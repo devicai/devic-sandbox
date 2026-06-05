@@ -645,12 +645,17 @@ export class SnapshotsService {
   }
 
   /**
-   * Full-filesystem capture. Archives only the paths `docker diff` reports as
-   * changed/added (minus excluded caches). For gzip (default) it compresses in
-   * a single streamed pass INSIDE the sandbox (`tar | gzip`) and copies the
+   * Full-filesystem capture. Archives only the changed/added paths from
+   * `sandbox.diff()` (minus excluded caches). For gzip (default) it compresses
+   * in a single streamed pass INSIDE the sandbox (`tar | gzip`) and copies the
    * compressed artifact out — metered, no uncompressed staging. For zstd it
    * emits a plain tar, copies it out and compresses host-side. Returns deleted
    * paths (to replay on restore) plus capture stats.
+   *
+   * Runtime-agnostic: the tar runs via `docker exec` inside the container, which
+   * sees the fully merged filesystem under both `runc` and `sysbox-runc`. The
+   * runtime difference is confined to how `sandbox.diff()` enumerates the
+   * changed set (docker diff vs in-container manifest); see DockerSandbox.diff().
    */
   private async captureFullToHost(
     sandbox: RuntimeSandbox,

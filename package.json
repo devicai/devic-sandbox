@@ -1,6 +1,6 @@
 {
   "name": "@devic-ai/sandbox",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Devic OS module — Sandbox orchestration layer using microsandbox",
   "author": "Devic AI <oss@devic.ai>",
   "license": "Apache-2.0",
