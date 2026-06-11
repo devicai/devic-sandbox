@@ -1,6 +1,6 @@
-# Devic Sandbox
+# Operator
 
-Standalone sandbox orchestration layer for ephemeral, secure code execution environments.
+Operator is Devic's open-source sandbox orchestration layer for ephemeral, secure code execution environments.
 
 Two pluggable runtime backends are supported:
 
@@ -142,7 +142,7 @@ runtime:
 
 #### Installing `sysbox-runc` on the host
 
-`sysbox-runc` is an OCI-compatible runtime that runs containers under user namespaces with a virtualized `/proc` and `/sys`, blocking the most common container escape vectors. Once installed Docker treats it as a regular runtime; `devic-sandbox` requests it with `runtime.docker.runtime: sysbox-runc`.
+`sysbox-runc` is an OCI-compatible runtime that runs containers under user namespaces with a virtualized `/proc` and `/sys`, blocking the most common container escape vectors. Once installed Docker treats it as a regular runtime; Operator requests it with `runtime.docker.runtime: sysbox-runc`.
 
 ```bash
 # Ubuntu 22.04+ / Debian 12+
@@ -307,7 +307,7 @@ Sample response:
 ## Architecture
 
 ```
-devic-sandbox/
+operator/
   src/                          # NestJS backend
     config/                     # YAML config loader with env var resolution
     schemas/                    # Mongoose schemas (Sandbox, SandboxProfile, Snapshot, McpProfile)

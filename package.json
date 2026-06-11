@@ -1,15 +1,16 @@
 {
-  "name": "@devic-ai/sandbox",
+  "name": "@devic-ai/operator",
   "version": "0.2.1",
-  "description": "Devic OS module — Sandbox orchestration layer using microsandbox",
+  "description": "Operator — Devic's open-source sandbox orchestration layer (microsandbox/Docker runtimes)",
   "author": "Devic AI <oss@devic.ai>",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/devic-ai/devic-sandbox"
+    "url": "https://github.com/devicai/operator"
   },
   "keywords": [
     "devic",
+    "operator",
     "ai",
     "sandbox",
     "microsandbox",

@@ -73,8 +73,8 @@ export class McpController implements OnModuleInit {
   ): Promise<McpServer> {
     const server = new McpServer({
       name: resolved
-        ? `devic-sandbox (${resolved.profile.name})`
-        : 'devic-sandbox',
+        ? `operator (${resolved.profile.name})`
+        : 'operator',
       version: process.env.npm_package_version ?? '0.1.0',
     });
     this.registerTools(server, resolved, session);
