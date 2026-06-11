@@ -576,7 +576,7 @@ function shellEscape(value: string): string {
 }
 
 /**
- * Best-effort detection of the container the devic-sandbox process itself is
+ * Best-effort detection of the container the Operator process itself is
  * running in. Used to attach `app` to a sandbox's isolated bridge so the
  * embedded ingress proxy can route to it.
  *

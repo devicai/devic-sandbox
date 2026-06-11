@@ -15,7 +15,7 @@ export interface IngressEntry {
 const REGISTRY_PREFIX = 'sandbox:ingress:';
 
 /**
- * Persists subdomain → upstream mappings in Redis so any devic-sandbox
+ * Persists subdomain → upstream mappings in Redis so any Operator
  * instance behind a load balancer can route requests for any sandbox.
  *
  * Keys are scoped by subdomain (the wildcard label) — for a request to

@@ -44,8 +44,8 @@ async function bootstrap() {
 
   // Swagger / OpenAPI
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('Devic Sandbox')
-    .setDescription('Sandbox orchestration API — microsandbox abstraction layer')
+    .setTitle('Operator')
+    .setDescription('Operator — sandbox orchestration API (microsandbox/Docker abstraction layer)')
     .setVersion(process.env.npm_package_version ?? '0.1.0')
     .addBearerAuth()
     .build();

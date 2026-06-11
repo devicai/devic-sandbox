@@ -169,7 +169,7 @@ export interface RuntimeHandle {
  * Returned by `RuntimeProvider.getAddress` and used by the public ingress proxy.
  */
 export interface SandboxAddress {
-  /** Host or IP reachable from the devic-sandbox process. */
+  /** Host or IP reachable from the Operator process. */
   host: string;
   /** TCP port reachable at `host`. */
   port: number;
