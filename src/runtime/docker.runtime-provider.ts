@@ -855,17 +855,20 @@ class DockerSandbox implements RuntimeSandbox {
       size: stat.size,
       mode: stat.mode & 0o777,
     });
-    const readStream = createReadStream(hostPath);
 
-    await new Promise<void>((resolve, reject) => {
-      entry.on('finish', () => {
-        pack.finalize();
-        resolve();
-      });
-      entry.on('error', reject);
-      readStream.on('error', reject);
-      readStream.pipe(entry);
-    });
+    // Stream the file into the tar entry and finalize the pack once it's fully
+    // written. CRITICAL: putArchive must consume `pack` *concurrently* with this
+    // pipe — do NOT await the entry's 'finish' before handing the pack over.
+    // `pack` is a readable stream with a ~16 KB internal buffer; with no consumer
+    // yet, piping any file larger than that fills the buffer, backpressure pauses
+    // the read, the entry never emits 'finish', and the copy deadlocks forever.
+    // That deadlock is exactly what hung snapshot restores: restoreFull() pushes
+    // the (multi-MB) snapshot tarball in via copyFromHost, so every real-sized
+    // snapshot got stuck here (only sub-16 KB ones ever completed).
+    const source = createReadStream(hostPath);
+    source.on('error', (err) => entry.destroy(err));
+    entry.on('finish', () => pack.finalize());
+    source.pipe(entry);
 
     await this.container.putArchive(pack as any, { path: dir });
   }
