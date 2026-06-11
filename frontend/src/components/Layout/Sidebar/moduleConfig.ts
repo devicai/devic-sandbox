@@ -23,7 +23,7 @@ export interface ModuleConfig {
 }
 
 export const MODULE_CONFIG: ModuleConfig = {
-  name: 'Sandbox',
+  name: 'Operator',
   icon: faTerminal,
   basePath: '/sandboxes',
   sections: [
